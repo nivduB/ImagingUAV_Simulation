@@ -1,1 +1,1 @@
-print("Hello from ImagingUAV container!")
+print("ImagingUAV container is alive")
