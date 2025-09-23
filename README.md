@@ -1,2 +1,5 @@
 # ImagingUAV_Simulation
-This is a test
+Dependencies: 
+numpy
+scipy
+matplotlib
