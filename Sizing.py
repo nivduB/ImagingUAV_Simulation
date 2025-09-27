@@ -14,7 +14,7 @@ F = 0.01                #[m] pinhole-to-sensor distance
 H = 0.50                #[m] height above the ground
 LambdaViolet = 400e-9   #[m] Violet wavelength for pinhole sizing
 LambdaRed = 700e-9      #[m] Red wavelength for pinhole sizing 
-HoleSize = 0.3e-3       #[m] Actual hole diameter (0.30 mm)
+HoleSize = 0.3e-3       #[m] Maximum Actual hole diameter (0.30 mm)
 
 def sensor():
     #for ifov we are using a small angle approximation
@@ -48,8 +48,8 @@ def pinhole():
     nFnoActualViolet = F / HoleSize 
 
     print(f"Violet 400 nm:")
-    print(f"Theoretical d* = {dTheoreticalViolet*1e3:.3f} mm, f/{nFnoTheoViolet:.1f}")
-    print(f"Conservative d* = {dConservativeViolet*1e3:.3f} mm, f/{nFnoConsViolet:.1f}\n")
+    print(f"Theoretical d = {dTheoreticalViolet*1e3:.3f} mm, f/{nFnoTheoViolet:.1f}")
+    print(f"Conservative d = {dConservativeViolet*1e3:.3f} mm, f/{nFnoConsViolet:.1f}\n")
     print(f" Actual d= {HoleSize*1e3:.3f} mm,  f/{nFnoActualViolet:.1f}\n")
 
     # --- Red (700 nm) ---
@@ -62,8 +62,8 @@ def pinhole():
 
 
     print(f"Red 700 nm:")
-    print(f"Theoretical d* = {dTheoreticalRed*1e3:.3f} mm, f/{nFnoTheoRed:.1f}")
-    print(f"Conservative d* = {dConservativeRed*1e3:.3f} mm, f/{nFnoConsRed:.1f}")
+    print(f"Theoretical d = {dTheoreticalRed*1e3:.3f} mm, f/{nFnoTheoRed:.1f}")
+    print(f"Conservative d = {dConservativeRed*1e3:.3f} mm, f/{nFnoConsRed:.1f}")
     print(f"  Actual d = {HoleSize*1e3:.3f} mm,  f/{nFnoActualRed:.1f}")
 
 
