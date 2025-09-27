@@ -11,6 +11,8 @@ from raysect.optical.observer import PinholeCamera, RGBPipeline2D
 
 
 # create camera (no pipeline kwarg)
+
+
 camera = PinholeCamera(
     pixels=(1024, 1),
     fov=45,
