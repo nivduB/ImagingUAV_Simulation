@@ -17,6 +17,7 @@ LambdaRed = 700e-9      #[m] Red wavelength for pinhole sizing
 HoleSize = 0.3e-3       #[m] Actual hole diameter (0.30 mm)
 
 def sensor():
+    #for ifov we are using a small angle approximation
     ifov = PixelWidth / F         #[rad] per pixel FOV or IFOV (we need to use pixel width)
     
     fovRad = NumberPixels * ifov          #[rad] getting actual FOV with total number of pixels
