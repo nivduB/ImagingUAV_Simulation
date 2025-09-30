@@ -18,10 +18,11 @@ HoleSize = 0.3e-3       #[m] Maximum Actual hole diameter (0.30 mm)
 
 def sensor():
     #for ifov we are using a small angle approximation
-    ifov = PixelWidth / F         #[rad] per pixel FOV or IFOV (we need to use pixel width)
-    
-    fovRad = NumberPixels * ifov          #[rad] getting actual FOV with total number of pixels
-    fovDeg = math.degrees(fovRad) #[deg] of FOV 
+    IFOV = 2*math.atan((PixelWidth/2)/F)                 # [rad] per pixel
+    FOV  = 2*math.atan(((NumberPixels*PixelWidth)/2)/F)  # [rad] total
+    fovDeg = math.degrees(FOV) #[deg] of FOV 
+    degResolution = fovDeg/NumberPixels  
+    print("degrees of Resolution:", degResolution)
     # Ground Sample Distance basically the amount of detail taken relative to the ground
     GSDx = H * (PixelWidth/F)      #[m] Ground Sample Distance. Real World Distance mapped by each pixel. This is width direction
     swath = NumberPixels * GSDx    #[m] total width of ground that is being covered by the scanner 
@@ -30,7 +31,7 @@ def sensor():
     sensorWidth = NumberPixels * PixelWidth               # Width of the sensor    
     phiEdge = math.atan((sensorWidth / 2) / F)            # Due to the nature of how the pixels are captured near the edge
     GSDCorrection = GSDx / math.cos(phiEdge)              #Corrects for how distances are stretched in one direction; This is linear GSD correction    
-    return ifov, fovRad, fovDeg, GSDx, swath, sensorWidth, phiEdge, GSDCorrection
+    return IFOV, FOV, fovDeg, GSDx, swath, sensorWidth, phiEdge, GSDCorrection
     
 def pinhole(): 
     #https://www.idexot.com/media/wysiwyg/02_Gaussian_Beam_Optics.pdf
@@ -72,10 +73,10 @@ def pinhole():
 if __name__ == "__main__":
     sensor()
     
-    ifov, fovRad, fovDeg, GSDx, swath, sensorWidth, phiEdge, GSDCorrection = sensor()
+    IFOV, FOV, fovDeg, GSDx, swath, sensorWidth, phiEdge, GSDCorrection = sensor()
     print("=== Sensor Geometry ===")
-    print(f"IFOV: {ifov:.6e} rad")
-    print(f"FOV:  {fovRad:.6f} rad  ({fovDeg:.2f} deg)")
+    print(f"IFOV: {IFOV:.6e} rad")
+    print(f"FOV:  {FOV:.6f} rad  ({fovDeg:.2f} deg)")
     print(f"GSDx: {GSDx*1e3:.3f} mm")
     print(f"Swath: {swath*1e2:.1f} cm")
     print(f"Edge angle: {math.degrees(phiEdge):.2f}°")
