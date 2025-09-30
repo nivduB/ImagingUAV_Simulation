@@ -20,5 +20,8 @@ We are using the Sizing.py document and then using those conditions for Raysect
     Pinhole size = 0.25mm
     Pinhole distance to sensor = 1cm
     Object distance to pinhole = 50cm
+Pivoting from gaussian beam optics to geometric optics model
+We are bottlenecked by manufaturing a pinhole small enough
+    We might have to use a mechanical pencil of 0.3mm diameter
 
 
