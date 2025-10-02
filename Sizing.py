@@ -41,7 +41,7 @@ def sensor():
     sensorWidth = NumberPixels * PixelWidth               # Width of the sensor    
     phiEdge = math.atan((sensorWidth / 2) / F)            # Due to the nature of how the pixels are captured near the edge
     GSDCorrection = GSDx / math.cos(phiEdge)              #Corrects for how distances are stretched in one direction; This is linear GSD correction    
-    return IFOV, FOV, fovDeg, GSDx, swath, sensorWidth, phiEdge, GSDCorrection, degResolution
+    return IFOV, FOV, fovDeg, GSDx, swath, sensorWidth, phiEdge, GSDCorrection, degResolution, effectivePixels, usablePixels
     
 def pinhole(): 
     #https://www.idexot.com/media/wysiwyg/02_Gaussian_Beam_Optics.pdf
@@ -83,7 +83,7 @@ def pinhole():
 if __name__ == "__main__":
     sensor()
     
-    IFOV, FOV, fovDeg, GSDx, swath, sensorWidth, phiEdge, GSDCorrection, degResolution = sensor()
+    IFOV, FOV, fovDeg, GSDx, swath, sensorWidth, phiEdge, GSDCorrection, degResolution, effectivePixels, usablePixels = sensor()
     print("=== Sensor Geometry ===")
     print(f"IFOV: {IFOV:.6e} rad")
     print(f"FOV:  {FOV:.6f} rad  ({fovDeg:.2f} deg)")
@@ -91,6 +91,8 @@ if __name__ == "__main__":
     print(f"Swath: {swath*1e2:.1f} cm")
     print(f"Edge angle: {math.degrees(phiEdge):.2f}°")
     print(f"GSD Correction (edge): {GSDCorrection*1e3:.3f} mm")
+    print(f"Effective Pixels: {effectivePixels:.1f})px")
+    print(f"Usable Pixels: {usablePixels:.1f})px")
     print(f"Angular Resolution: {degResolution:.3f} degrees\n")
 
     # Call pinhole() to show pinhole sizing for violet and red
