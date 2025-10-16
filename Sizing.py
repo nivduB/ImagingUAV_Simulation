@@ -7,9 +7,9 @@ import math
 #[rad] radians
 #[deg] degrees
 
-PixelWidth = 7.5e-6     #[m] pixel width (across-track); This is what we will need for the IFOV calc
+PixelWidth = 30e-6     #[m] pixel width (across-track); This is what we will need for the IFOV calc
 PixelHeight = 120e-6     #[m] pixel height 
-NumberPixels = 1024     #[px] Number of Pixels as denoted 1024 x 1 
+NumberPixels = 128     #[px] Number of Pixels as denoted 1024 x 1 
 F = 0.01                #[m] pinhole-to-sensor distance 
 H = 0.50                #[m] height above the ground
 LambdaViolet = 400e-9   #[m] Violet wavelength for pinhole sizing
