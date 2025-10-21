@@ -1,0 +1,22 @@
+//GPIO
+/ {
+    zephyr,user {
+        io-channels = <&adc 0>;
+    };
+    
+    aliases {
+        led0 = &led0;
+    };
+    
+    leds {
+        compatible = "gpio-leds";
+        led0: led_0 {
+            gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>; /* P0.04 - adjust pin as needed */
+            label = "Test LED";
+        };
+    };
+};
+
+&adc {
+ status = "okay";
+};
