@@ -41,6 +41,24 @@ static int16_t saadc_sample_buffer[2][SAADC_BUFFER_SIZE];
 /* STEP 4.3 - Declare variable used to keep track of which buffer was last assigned to the SAADC driver */
 static uint32_t saadc_current_buffer = 0;
 
+// Pack 4x 10-bit samples into 5 bytes
+static inline void pack_four_10bit(uint16_t s0, uint16_t s1,
+                                   uint16_t s2, uint16_t s3,
+                                   uint8_t *out)
+{
+    s0 &= 0x03FF;  // mask to 10 bits
+    s1 &= 0x03FF;
+    s2 &= 0x03FF;
+    s3 &= 0x03FF;
+
+    out[0] = s0 & 0xFF;                              // low 8 bits of s0
+    out[1] = ((s0 >> 8) & 0x03) | ((s1 & 0x3F) << 2);
+    out[2] = ((s1 >> 6) & 0x0F) | ((s2 & 0x0F) << 4);
+    out[3] = ((s2 >> 4) & 0x3F) | ((s3 & 0x03) << 6);
+    out[4] = (s3 >> 2) & 0xFF;                       // remaining 8 bits of s3
+}
+
+
 static void configure_timer(void)
 {
     nrfx_err_t err;
@@ -85,13 +103,15 @@ static void saadc_event_handler(nrfx_saadc_evt_t const * p_event)
 
         case NRFX_SAADC_EVT_DONE:
 
-            /* STEP 5.3 - Buffer has been filled. Do something with the data and proceed */
+			//This logs the first sample No longer in use and was mainly used to learn how to print to the buffer
+			/*
+            /* STEP 5.3 - Buffer has been filled. Do something with the data and proceed 
 			int64_t average = 0;
 			int16_t max = INT16_MIN;
 			int16_t min = INT16_MAX;
 			int16_t current_value;
 
-			//This logs the first sample
+			
 			int16_t first_val = ((int16_t *)(p_event->data.done.p_buffer))[0];
 			LOG_INF("FIRST=%d", first_val);
 
@@ -105,12 +125,47 @@ static void saadc_event_handler(nrfx_saadc_evt_t const * p_event)
 					min = current_value;
 				}
 			}
+			
 			average = average / p_event->data.done.size;
+			*/
 			/*LOG_INF("SAADC buffer at 0x%x filled with %d samples", (uint32_t)p_event->data.done.p_buffer,
 				p_event->data.done.size);
 			
 				LOG_INF("AVG=%d, MIN=%d, MAX=%d", (int16_t)average, min, max);
 				*/
+
+			int16_t *buf = p_event->data.done.p_buffer;
+            size_t n_samples = p_event->data.done.size;
+
+            // Each 4 samples (40 bits) -> 5 bytes
+            size_t packed_size = (n_samples / 4) * 5;
+            static uint8_t packed_buffer[SAADC_BUFFER_SIZE * 2]; // safe upper bound
+
+            size_t out_index = 0;
+            for (size_t i = 0; i + 3 < n_samples; i += 4) {
+                pack_four_10bit((uint16_t)buf[i],
+                                (uint16_t)buf[i+1],
+                                (uint16_t)buf[i+2],
+                                (uint16_t)buf[i+3],
+                                &packed_buffer[out_index]);
+                out_index += 5;
+            }
+
+            // Handle leftover samples if n_samples not divisible by 4
+            size_t leftover = n_samples % 4;
+            if (leftover) {
+                for (size_t i = n_samples - leftover; i < n_samples; i++) {
+                    packed_buffer[out_index++] = buf[i] & 0xFF;
+                    packed_buffer[out_index++] = (buf[i] >> 8) & 0x03;
+                }
+            }
+
+            LOG_INF("10-bit packed %u samples (%u bytes) into %u bytes",
+                    n_samples,
+                    (unsigned)(n_samples * sizeof(int16_t)),
+                    (unsigned)out_index);
+
+            // packed_buffer[0..out_index-1] is ready to transmit over BLE
 
             break;
 
