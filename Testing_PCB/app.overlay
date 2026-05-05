@@ -1,0 +1,7 @@
+&uart30 {
+    status = "disabled";
+};
+
+&adc {
+    status = "okay";
+};
