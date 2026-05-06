@@ -1,36 +1,36 @@
 /*
- * BLE Transmitter for EPC901 CCD Line Sensor (1024 pixels)
- * nRF54L15 / nRF Connect SDK v3.1.1
+ * EPC901 BLE Transmitter — nRF54L15
+ * nRF Connect SDK v3.1.1
  *
- * Triggered capture mode:
- *   - Burst thread waits for capture_ready flag
- *   - Flag is set by SAADC EVT_DONE after 1024 samples are collected
- *   - SAADC sampling started by EPC901 READ pulse after SHUTTER + DATA_RDY
- *   - TIMER22 drives SAADC via DPPI — no CPU involvement during sampling
- *   - One frame captured and transmitted per trigger
+ * Flow per frame:
+ *   1. Receiver writes 0x01 to CMD characteristic  → capture_requested = true
+ *   2. Burst thread arms SAADC (two 1024-sample buffers, TIMER22+DPPI)
+ *   3. Burst thread runs EPC901 capture sequence:
+ *        CLR_PIX → CLR_DATA → SHUTTER (expose) → wait DATA_RDY →
+ *        READ pulse (CDS) → 3 preload clocks → enable TIMER22 →
+ *        1024 READ clocks (pixel clock)
+ *   4. SAADC EVT_DONE fires → capture_ready = true, timer disabled
+ *   5. Burst thread packs 1024 × 10-bit → 1280 bytes
+ *   6. Sends 1280 bytes as BLE notifications (244 bytes per packet)
  *
- * ADC pin:  AIN4 = P1.11 (nRF54L15)
- * Timer:    TIMER22 @ 16 MHz, 1 µs compare → 1 Msps
- *
- * EPC901 GPIO pins — TODO: replace with real pin numbers from PCB schematic
- *   SHUTTER   → GPIO output
- *   READ      → GPIO output
- *   CLR_DATA  → GPIO output
- *   CLR_PIX   → GPIO output
- *   DATA_RDY  → GPIO input
+ * Wiring:
+ *   DATA_RDY  → P1.10  (J1 pin 5)
+ *   VIDEO_P   → P1.11  (J1 pin 4)   AIN4
+ *   READ      → P1.12  (J1 pin 8)
+ *   CLR_PIX   → P2.06  (J1 pin 7)
+ *   SHUTTER   → P2.08  (J1 pin 9)
+ *   CLR_DATA  → P2.09  (J2 pin 3)
+ *   PWR_DOWN  → P2.10  (J2 pin 1)
+ *   GND       → GND    (J1 pin 10)
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/sys/printk.h>
-#include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/i2c.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
-
-/* nrfx drivers for hardware-timed ADC */
+#include <hal/nrf_gpio.h>
 #include <nrfx_saadc.h>
 #include <nrfx_timer.h>
 #include <helpers/nrfx_gppi.h>
@@ -40,11 +40,11 @@
 #include <nrfx_ppi.h>
 #endif
 
-LOG_MODULE_REGISTER(EPC901_Transmitter, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(EPC901_TX, LOG_LEVEL_INF);
 
-/* --------------------------------------------------------------------------
- * UUIDs
- * -------------------------------------------------------------------------- */
+/* ==========================================================================
+ * UUIDs — must match receiver exactly
+ * ========================================================================== */
 #define BT_UUID_EPC901_SERVICE_VAL \
     BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
 #define BT_UUID_EPC901_DATA_VAL \
@@ -56,457 +56,398 @@ LOG_MODULE_REGISTER(EPC901_Transmitter, LOG_LEVEL_INF);
 #define BT_UUID_EPC901_DATA     BT_UUID_DECLARE_128(BT_UUID_EPC901_DATA_VAL)
 #define BT_UUID_EPC901_CMD      BT_UUID_DECLARE_128(BT_UUID_EPC901_CMD_VAL)
 
-/* --------------------------------------------------------------------------
- * Configuration
- * -------------------------------------------------------------------------- */
-#define SAMPLES_PER_FRAME        1024
-#define BLE_PACKET_SIZE          244   /* preferred, requires MTU 247 */
-#define BLE_PACKET_SIZE_FALLBACK 20    /* safe minimum if MTU not yet negotiated */
-#define SAADC_SAMPLE_INTERVAL_US 1     /* 1 µs → 1 Msps */
-
-BUILD_ASSERT(SAMPLES_PER_FRAME % 4 == 0, "SAMPLES_PER_FRAME must be a multiple of 4");
-
-/* --------------------------------------------------------------------------
- * EPC901 GPIO Pin Definitions
- * TODO: Replace placeholder pin numbers with real values from PCB schematic.
- * Format: NRF_PIN_PORT_TO_PIN_NUMBER(pin, port)
- *   port 0 = P0.xx, port 1 = P1.xx
- * -------------------------------------------------------------------------- */
-#define EPC901_SHUTTER_PIN   NRF_PIN_PORT_TO_PIN_NUMBER(0U, 0)  /* TODO: P0.00 placeholder */
-#define EPC901_READ_PIN      NRF_PIN_PORT_TO_PIN_NUMBER(1U, 0)  /* TODO: P0.01 placeholder */
-#define EPC901_CLR_DATA_PIN  NRF_PIN_PORT_TO_PIN_NUMBER(4U, 0)  /* TODO: P0.04 placeholder */
-#define EPC901_CLR_PIX_PIN   NRF_PIN_PORT_TO_PIN_NUMBER(5U, 1)  /* TODO: P1.05 placeholder */
-#define EPC901_DATA_RDY_PIN  NRF_PIN_PORT_TO_PIN_NUMBER(6U, 1)  /* TODO: P1.06 placeholder */
-
-/* --------------------------------------------------------------------------
- * EPC901 I2C
- * TODO: Replace I2C address once CS0/CS1 pin config confirmed from schematic.
- * Run i2c_scan() at first power-on to discover actual address.
- * -------------------------------------------------------------------------- */
-#define EPC901_I2C_ADDR  0x10  /* TODO: confirm from PCB schematic CS0/CS1 config */
-
-/* --------------------------------------------------------------------------
- * ADC / Timer setup (nRF54L15-specific)
- * -------------------------------------------------------------------------- */
+/* ==========================================================================
+ * Pin definitions
+ * ========================================================================== */
 #define NRF_SAADC_INPUT_AIN4   NRF_PIN_PORT_TO_PIN_NUMBER(11U, 1)
-#define SAADC_INPUT_PIN        NRF_SAADC_INPUT_AIN4
-#define TIMER_INSTANCE_NUMBER  22
 
-static nrfx_saadc_channel_t   adc_channel = NRFX_SAADC_DEFAULT_CHANNEL_SE(SAADC_INPUT_PIN, 0);
+#define PIN_DATA_RDY   NRF_GPIO_PIN_MAP(1, 10)
+#define PIN_READ       NRF_GPIO_PIN_MAP(1, 12)
+#define PIN_CLR_PIX    NRF_GPIO_PIN_MAP(2, 6)
+#define PIN_SHUTTER    NRF_GPIO_PIN_MAP(2, 8)
+#define PIN_CLR_DATA   NRF_GPIO_PIN_MAP(2, 9)
+#define PIN_PWR_DOWN   NRF_GPIO_PIN_MAP(2, 10)
+
+/* ==========================================================================
+ * Config
+ * ========================================================================== */
+#define PIXELS_PER_FRAME      1024
+#define PACKED_FRAME_BYTES    1280        /* 1024 × 10-bit packed */
+#define BLE_PACKET_SIZE        244        /* MTU 247 − 3 bytes ATT overhead */
+#define PRELOAD_CLOCKS           3
+#define TIMER_INSTANCE_NUMBER   22
+
+/* ==========================================================================
+ * SAADC / Timer globals
+ * ========================================================================== */
+static nrfx_saadc_channel_t   saadc_channel;
 static const nrfx_timer_t     timer_instance = NRFX_TIMER_INSTANCE(TIMER_INSTANCE_NUMBER);
 
-/* Double-buffer for SAADC */
-static int16_t saadc_buf[2][SAMPLES_PER_FRAME];
+static int16_t  saadc_buf[2][PIXELS_PER_FRAME];
 static uint32_t saadc_current_buffer = 0;
 
-/* --------------------------------------------------------------------------
- * Device handles
- * -------------------------------------------------------------------------- */
-static const struct device *gpio0_dev;
-static const struct device *gpio1_dev;
-static const struct device *i2c_dev;
+static volatile bool     capture_ready = false;
+static volatile int16_t *capture_buf   = NULL;
 
-/* --------------------------------------------------------------------------
- * BLE state
- * -------------------------------------------------------------------------- */
-static struct bt_conn *current_conn = NULL;
-static bool ble_ready = false;
+static uint8_t ppi_timer_to_saadc;
+static uint8_t ppi_saadc_end_to_start;
 
-/* --------------------------------------------------------------------------
- * Shared state between SAADC event handler and burst thread
- * -------------------------------------------------------------------------- */
-static volatile bool    capture_requested = false;
-static volatile bool    capture_ready     = false;
-static volatile int16_t *capture_buf      = NULL;
+/* ==========================================================================
+ * BLE globals
+ * ========================================================================== */
+static struct bt_conn *current_conn     = NULL;
+static volatile bool   ble_ready        = false;   /* CCCD subscribed */
+static volatile bool   capture_requested = false;
 
-/* Output packed buffer: 1024 * 10 bits = 1280 bytes */
-static uint8_t packed_buffer[SAMPLES_PER_FRAME * 10 / 8 + 10];
+/* Packed output buffer */
+static uint8_t packed_buf[PACKED_FRAME_BYTES];
 
-/* Stats */
-static struct {
-    uint32_t frames_captured;
-    uint32_t frames_transmitted;
-    uint32_t send_errors;
-} stats = {0};
-
-/* --------------------------------------------------------------------------
- * 10-bit Packing — 4 samples → 5 bytes
- * -------------------------------------------------------------------------- */
-static inline void pack_four_10bit(uint16_t s0, uint16_t s1,
-                                   uint16_t s2, uint16_t s3,
-                                   uint8_t *out)
+/* ==========================================================================
+ * GPIO helpers
+ * ========================================================================== */
+static void configure_output(uint32_t pin)
 {
-    s0 &= 0x03FF; s1 &= 0x03FF; s2 &= 0x03FF; s3 &= 0x03FF;
-    out[0] = s0 & 0xFF;
-    out[1] = ((s0 >> 8) & 0x03) | ((s1 & 0x3F) << 2);
-    out[2] = ((s1 >> 6) & 0x0F) | ((s2 & 0x0F) << 4);
-    out[3] = ((s2 >> 4) & 0x3F) | ((s3 & 0x03) << 6);
-    out[4] = (s3 >> 2) & 0xFF;
+    nrf_gpio_cfg(pin,
+                 NRF_GPIO_PIN_DIR_OUTPUT,
+                 NRF_GPIO_PIN_INPUT_DISCONNECT,
+                 NRF_GPIO_PIN_NOPULL,
+                 NRF_GPIO_PIN_H0H1,
+                 NRF_GPIO_PIN_NOSENSE);
+    nrf_gpio_pin_clear(pin);
 }
 
-/* --------------------------------------------------------------------------
- * SAADC Event Handler — runs in interrupt context
- * -------------------------------------------------------------------------- */
+static void configure_digital_pins(void)
+{
+    configure_output(PIN_CLR_PIX);
+    configure_output(PIN_READ);
+    configure_output(PIN_SHUTTER);
+    configure_output(PIN_CLR_DATA);
+    configure_output(PIN_PWR_DOWN);
+
+    nrf_gpio_cfg_input(PIN_DATA_RDY, NRF_GPIO_PIN_PULLDOWN);
+
+    LOG_INF("Digital pins configured.");
+}
+
+/* ==========================================================================
+ * Timer
+ * ========================================================================== */
+static void configure_timer(void)
+{
+    nrfx_timer_config_t cfg = NRFX_TIMER_DEFAULT_CONFIG(16000000);
+    nrfx_err_t err = nrfx_timer_init(&timer_instance, &cfg, NULL);
+    if (err != NRFX_SUCCESS) {
+        LOG_ERR("timer_init error: 0x%08x", err);
+        return;
+    }
+
+    /* 1 µs period → 1 Msps */
+    uint32_t ticks = nrfx_timer_us_to_ticks(&timer_instance, 1);
+    nrfx_timer_extended_compare(&timer_instance,
+                                 NRF_TIMER_CC_CHANNEL0,
+                                 ticks,
+                                 NRF_TIMER_SHORT_COMPARE0_CLEAR_MASK,
+                                 false);
+
+    LOG_INF("TIMER22 configured: %u ticks/sample (1 Msps)", ticks);
+}
+
+/* ==========================================================================
+ * SAADC event handler
+ * ========================================================================== */
 static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 {
-    nrfx_err_t err;
-
     switch (p_event->type) {
 
     case NRFX_SAADC_EVT_READY:
-        nrfx_timer_enable(&timer_instance);
-        LOG_INF("SAADC ready, timer started.");
+        LOG_DBG("SAADC READY");
         break;
 
     case NRFX_SAADC_EVT_BUF_REQ:
-        err = nrfx_saadc_buffer_set(
+        /* Double-buffer: queue the next buffer when the current one starts */
+        nrfx_saadc_buffer_set(
             saadc_buf[(saadc_current_buffer++) % 2],
-            SAMPLES_PER_FRAME);
-        if (err != NRFX_SUCCESS) {
-            LOG_ERR("saadc_buffer_set error: 0x%08x", err);
-        }
+            PIXELS_PER_FRAME);
         break;
 
     case NRFX_SAADC_EVT_DONE:
-        /* Buffer full — stop timer, hand buffer to burst thread */
+        /*
+         * First buffer is full — stop everything.
+         * Disable timer so no more SAMPLE triggers fire.
+         * Disable auto-restart PPI so the second buffer doesn't start.
+         */
         nrfx_timer_disable(&timer_instance);
+        nrfx_gppi_channels_disable(BIT(ppi_saadc_end_to_start));
+
         capture_buf   = p_event->data.done.p_buffer;
         capture_ready = true;
         break;
 
     default:
-        LOG_DBG("Unhandled SAADC evt %d", p_event->type);
         break;
     }
 }
 
-/* --------------------------------------------------------------------------
- * SAADC Init
- * -------------------------------------------------------------------------- */
+/* ==========================================================================
+ * SAADC init
+ * ========================================================================== */
 static void configure_saadc(void)
 {
-    nrfx_err_t err;
-
     IRQ_CONNECT(DT_IRQN(DT_NODELABEL(adc)),
                 DT_IRQ(DT_NODELABEL(adc), priority),
                 nrfx_isr, nrfx_saadc_irq_handler, 0);
 
-    err = nrfx_saadc_init(DT_IRQ(DT_NODELABEL(adc), priority));
+    nrfx_err_t err = nrfx_saadc_init(DT_IRQ(DT_NODELABEL(adc), priority));
     if (err != NRFX_SUCCESS) {
-        LOG_ERR("nrfx_saadc_init error: 0x%08x", err);
+        LOG_ERR("saadc_init error: 0x%08x", err);
         return;
     }
 
-    adc_channel.channel_config.gain = NRF_SAADC_GAIN1_4;
+    saadc_channel = (nrfx_saadc_channel_t)NRFX_SAADC_DEFAULT_CHANNEL_SE(
+        NRF_SAADC_INPUT_AIN4, 0);
+    saadc_channel.channel_config.gain     = NRF_SAADC_GAIN1_4;
+    saadc_channel.channel_config.acq_time = 1;
 
-    err = nrfx_saadc_channels_config(&adc_channel, 1);
+    err = nrfx_saadc_channels_config(&saadc_channel, 1);
     if (err != NRFX_SUCCESS) {
-        LOG_ERR("nrfx_saadc_channels_config error: 0x%08x", err);
+        LOG_ERR("saadc_channels_config error: 0x%08x", err);
         return;
     }
 
-    nrfx_saadc_adv_config_t adv_cfg = NRFX_SAADC_DEFAULT_ADV_CONFIG;
+    nrfx_saadc_adv_config_t adv = NRFX_SAADC_DEFAULT_ADV_CONFIG;
     err = nrfx_saadc_advanced_mode_set(BIT(0),
-                                       NRF_SAADC_RESOLUTION_10BIT,
-                                       &adv_cfg,
-                                       saadc_event_handler);
+                                        NRF_SAADC_RESOLUTION_10BIT,
+                                        &adv,
+                                        saadc_event_handler);
     if (err != NRFX_SUCCESS) {
-        LOG_ERR("nrfx_saadc_advanced_mode_set error: 0x%08x", err);
+        LOG_ERR("saadc_advanced_mode_set error: 0x%08x", err);
         return;
     }
 
-    err = nrfx_saadc_buffer_set(saadc_buf[0], SAMPLES_PER_FRAME);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("saadc_buffer_set [0] error: 0x%08x", err);
-        return;
-    }
-    err = nrfx_saadc_buffer_set(saadc_buf[1], SAMPLES_PER_FRAME);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("saadc_buffer_set [1] error: 0x%08x", err);
-        return;
-    }
-
-    err = nrfx_saadc_mode_trigger();
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("nrfx_saadc_mode_trigger error: 0x%08x", err);
-        return;
-    }
-
-    LOG_INF("SAADC configured (10-bit, AIN4/P1.11).");
+    LOG_INF("SAADC configured (AIN4, 10-bit, 1 Msps).");
 }
 
-/* --------------------------------------------------------------------------
- * Timer Init
- * -------------------------------------------------------------------------- */
-static void configure_timer(void)
-{
-    nrfx_err_t err;
-
-    nrfx_timer_config_t timer_cfg = NRFX_TIMER_DEFAULT_CONFIG(16000000);
-    err = nrfx_timer_init(&timer_instance, &timer_cfg, NULL);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("nrfx_timer_init error: 0x%08x", err);
-        return;
-    }
-
-    uint32_t ticks = nrfx_timer_us_to_ticks(&timer_instance,
-                                             SAADC_SAMPLE_INTERVAL_US);
-    nrfx_timer_extended_compare(&timer_instance,
-                                NRF_TIMER_CC_CHANNEL0,
-                                ticks,
-                                NRF_TIMER_SHORT_COMPARE0_CLEAR_MASK,
-                                false);
-
-    LOG_INF("TIMER22 configured (%u µs interval = %u ticks).",
-            SAADC_SAMPLE_INTERVAL_US, ticks);
-}
-
-/* --------------------------------------------------------------------------
- * DPPI — wire TIMER COMPARE → SAADC SAMPLE
- *         and SAADC END → SAADC START
- * -------------------------------------------------------------------------- */
+/* ==========================================================================
+ * DPPI
+ * ========================================================================== */
 static void configure_ppi(void)
 {
     nrfx_err_t err;
-    uint8_t ppi_sample_ch;
-    uint8_t ppi_start_ch;
 
-    err = nrfx_gppi_channel_alloc(&ppi_sample_ch);
+    err = nrfx_gppi_channel_alloc(&ppi_timer_to_saadc);
     if (err != NRFX_SUCCESS) {
-        LOG_ERR("gppi_channel_alloc (sample) error: 0x%08x", err);
+        LOG_ERR("gppi alloc (timer->saadc): 0x%08x", err);
         return;
     }
 
-    err = nrfx_gppi_channel_alloc(&ppi_start_ch);
+    err = nrfx_gppi_channel_alloc(&ppi_saadc_end_to_start);
     if (err != NRFX_SUCCESS) {
-        LOG_ERR("gppi_channel_alloc (start) error: 0x%08x", err);
+        LOG_ERR("gppi alloc (end->start): 0x%08x", err);
         return;
     }
 
+    /* TIMER22 CC[0] → SAADC SAMPLE task */
     nrfx_gppi_channel_endpoints_setup(
-        ppi_sample_ch,
-        nrfx_timer_compare_event_address_get(&timer_instance, NRF_TIMER_CC_CHANNEL0),
+        ppi_timer_to_saadc,
+        nrfx_timer_compare_event_address_get(&timer_instance,
+                                              NRF_TIMER_CC_CHANNEL0),
         nrf_saadc_task_address_get(NRF_SAADC, NRF_SAADC_TASK_SAMPLE));
 
+    /* SAADC END event → SAADC START task (enables double buffering) */
     nrfx_gppi_channel_endpoints_setup(
-        ppi_start_ch,
+        ppi_saadc_end_to_start,
         nrf_saadc_event_address_get(NRF_SAADC, NRF_SAADC_EVENT_END),
         nrf_saadc_task_address_get(NRF_SAADC, NRF_SAADC_TASK_START));
 
-    nrfx_gppi_channels_enable(BIT(ppi_sample_ch));
-    nrfx_gppi_channels_enable(BIT(ppi_start_ch));
+    /* Only the timer→saadc channel is always active.
+     * end→start is re-enabled per capture and disabled in EVT_DONE. */
+    nrfx_gppi_channels_enable(BIT(ppi_timer_to_saadc));
 
     LOG_INF("DPPI configured.");
 }
 
-/* --------------------------------------------------------------------------
- * EPC901 GPIO Init
- * TODO: Update pin numbers once PCB schematic is available.
- * -------------------------------------------------------------------------- */
-static int epc901_gpio_init(void)
+/* ==========================================================================
+ * Arm SAADC for one frame capture
+ * ========================================================================== */
+static bool arm_saadc(void)
 {
-    gpio0_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
-    gpio1_dev = DEVICE_DT_GET(DT_NODELABEL(gpio1));
+    nrfx_saadc_abort();
+    k_sleep(K_MSEC(1));
 
-    if (!device_is_ready(gpio0_dev) || !device_is_ready(gpio1_dev)) {
-        LOG_ERR("GPIO devices not ready");
-        return -1;
+    capture_ready        = false;
+    capture_buf          = NULL;
+    saadc_current_buffer = 0;
+
+    /* Re-enable auto-restart PPI for double buffering */
+    nrfx_gppi_channels_enable(BIT(ppi_saadc_end_to_start));
+
+    nrfx_err_t err = nrfx_saadc_buffer_set(saadc_buf[0], PIXELS_PER_FRAME);
+    if (err != NRFX_SUCCESS) {
+        LOG_ERR("buffer_set[0] error: 0x%08x", err);
+        return false;
     }
 
-    /* Outputs — drive low by default */
-    gpio_pin_configure(gpio0_dev, NRF_GET_PIN(EPC901_SHUTTER_PIN),  GPIO_OUTPUT_LOW);
-    gpio_pin_configure(gpio0_dev, NRF_GET_PIN(EPC901_READ_PIN),     GPIO_OUTPUT_LOW);
-    gpio_pin_configure(gpio0_dev, NRF_GET_PIN(EPC901_CLR_DATA_PIN), GPIO_OUTPUT_LOW);
-    gpio_pin_configure(gpio1_dev, NRF_GET_PIN(EPC901_CLR_PIX_PIN),  GPIO_OUTPUT_LOW);
+    err = nrfx_saadc_buffer_set(saadc_buf[1], PIXELS_PER_FRAME);
+    if (err != NRFX_SUCCESS) {
+        LOG_ERR("buffer_set[1] error: 0x%08x", err);
+        return false;
+    }
 
-    /* Input — DATA_RDY from EPC901 */
-    gpio_pin_configure(gpio1_dev, NRF_GET_PIN(EPC901_DATA_RDY_PIN), GPIO_INPUT);
+    err = nrfx_saadc_mode_trigger();
+    if (err != NRFX_SUCCESS) {
+        LOG_ERR("mode_trigger error: 0x%08x", err);
+        return false;
+    }
 
-    LOG_INF("EPC901 GPIO initialized.");
-    return 0;
+    return true;
 }
 
-/* --------------------------------------------------------------------------
- * I2C Scan — run once at startup to discover EPC901 I2C address
- * Remove or disable after address is confirmed.
- * -------------------------------------------------------------------------- */
-static void i2c_scan(void)
+/* ==========================================================================
+ * EPC901 capture sequence
+ * ========================================================================== */
+static bool epc901_capture(void)
 {
-    LOG_INF("Scanning I2C bus...");
-    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
-        uint8_t dummy;
-        if (i2c_read(i2c_dev, &dummy, 1, addr) == 0) {
-            LOG_INF("  Found I2C device at 0x%02x", addr);
-        }
-    }
-    LOG_INF("I2C scan complete.");
-}
+    /* Step 1: Clear pixel array and data register */
+    nrf_gpio_pin_set(PIN_CLR_PIX);
+    k_sleep(K_MSEC(1));
+    nrf_gpio_pin_clear(PIN_CLR_PIX);
+    k_sleep(K_MSEC(1));
 
-/* --------------------------------------------------------------------------
- * EPC901 I2C Init
- * Configures sensor registers over I2C at startup.
- * TODO: Confirm I2C address from PCB schematic CS0/CS1 config.
- * -------------------------------------------------------------------------- */
-static int epc901_i2c_init(void)
-{
-    i2c_dev = DEVICE_DT_GET(DT_NODELABEL(i2c20));
-    if (!device_is_ready(i2c_dev)) {
-        LOG_ERR("I2C device not ready");
-        return -1;
-    }
+    nrf_gpio_pin_set(PIN_CLR_DATA);
+    k_sleep(K_MSEC(1));
+    nrf_gpio_pin_clear(PIN_CLR_DATA);
+    k_sleep(K_MSEC(5));
 
-    /* Scan bus to verify EPC901 is present and find its address */
-    i2c_scan();
-
-    uint8_t chip_rev;
-    int ret = i2c_reg_read_byte(i2c_dev, EPC901_I2C_ADDR, 0xFF, &chip_rev);
-    if (ret != 0) {
-        LOG_ERR("EPC901 I2C read failed (err %d) — check address and wiring", ret);
-        return -1;
-    }
-    LOG_INF("EPC901 chip rev: 0x%02x", chip_rev);
-
-    /* MISC_CONF (0x02): preserve defaults, set RD_CONF_CTRL=1 (bit 0)
-     * Default = 0x98, set bit 0 → 0x99
-     * This enables I2C register control instead of hardware config pins */
-    i2c_reg_write_byte(i2c_dev, EPC901_I2C_ADDR, 0x02, 0x99);
-
-    /* ACQ_TX_CONF_I2C (0x00):
-     * HOR_BIN = 01 (no binning, bits 5:4)
-     * GAIN    = 01 (gain x1, bits 3:2)
-     * ROI_SEL = 0  (all 1024 pixels, bit 1)
-     * RD_DIR  = 0  (read 0→1023, bit 0)
-     * Value = 0b00010100 = 0x14 */
-    i2c_reg_write_byte(i2c_dev, EPC901_I2C_ADDR, 0x00, 0x14);
-
-    /* BW_VIDEO_CONF_IC2 (0x01):
-     * BW_VIDEO = 0101 → max bandwidth 16MHz (bits 3:0)
-     * Value = 0x05 */
-    i2c_reg_write_byte(i2c_dev, EPC901_I2C_ADDR, 0x01, 0x05);
-
-    LOG_INF("EPC901 I2C init complete.");
-    return 0;
-}
-
-/* --------------------------------------------------------------------------
- * EPC901 Frame Capture Sequence
- *
- * Sequence per frame (from EPC901 datasheet):
- *   1. CLR_PIX  — clear pixel array charge
- *   2. CLR_DATA — clear data register
- *   3. Integration period — sensor collects light
- *   4. SHUTTER  — freeze the frame (end integration)
- *   5. Wait DATA_RDY HIGH — frame ready to read
- *   6. READ pulse — sensor starts outputting pixels on VIDEO_P
- *   7. SAADC + TIMER22 samples VIDEO_P 1024 times at 1MHz automatically
- *   8. SAADC EVT_DONE fires → capture_ready = true
- *
- * NOTE: This function only initiates the capture. The burst thread waits
- * for capture_ready before packing and transmitting.
- * -------------------------------------------------------------------------- */
-static void epc901_start_capture(void)
-{
-    /* 1. Clear pixel array */
-    gpio_pin_set(gpio1_dev, NRF_GET_PIN(EPC901_CLR_PIX_PIN), 1);
-    k_busy_wait(1);
-    gpio_pin_set(gpio1_dev, NRF_GET_PIN(EPC901_CLR_PIX_PIN), 0);
-
-    /* 2. Clear data register */
-    gpio_pin_set(gpio0_dev, NRF_GET_PIN(EPC901_CLR_DATA_PIN), 1);
-    k_busy_wait(1);
-    gpio_pin_set(gpio0_dev, NRF_GET_PIN(EPC901_CLR_DATA_PIN), 0);
-
-    /* 3. Integration period — sensor collects light
-     * Adjust this value for exposure. Start with 10ms for indoor testing. */
+    /* Step 2: Expose */
+    nrf_gpio_pin_set(PIN_SHUTTER);
     k_sleep(K_MSEC(10));
 
-    /* 4. SHUTTER — freeze the frame */
-    gpio_pin_set(gpio0_dev, NRF_GET_PIN(EPC901_SHUTTER_PIN), 1);
-    k_busy_wait(1);
-    gpio_pin_set(gpio0_dev, NRF_GET_PIN(EPC901_SHUTTER_PIN), 0);
+    /* Step 3: End exposure */
+    nrf_gpio_pin_clear(PIN_SHUTTER);
 
-    /* 5. Wait for DATA_RDY HIGH (timeout 10ms) */
-    uint32_t timeout_us = 10000;
-    while (!gpio_pin_get(gpio1_dev, NRF_GET_PIN(EPC901_DATA_RDY_PIN))) {
-        k_busy_wait(1);
-        if (--timeout_us == 0) {
-            LOG_ERR("DATA_RDY timeout — check EPC901 wiring");
-            return;
-        }
+    /* Step 4: Wait for DATA_RDY */
+    uint32_t timeout = 500;
+    while (nrf_gpio_pin_read(PIN_DATA_RDY) == 0 && timeout > 0) {
+        k_sleep(K_MSEC(1));
+        timeout--;
+    }
+    if (timeout == 0) {
+        LOG_ERR("DATA_RDY timeout — aborting capture");
+        return false;
     }
 
-    /* 6. READ pulse — EPC901 starts clocking pixels onto VIDEO_P
-     * SAADC + TIMER22 via DPPI will sample automatically from this point */
-    gpio_pin_set(gpio0_dev, NRF_GET_PIN(EPC901_READ_PIN), 1);
-    k_busy_wait(1);
-    gpio_pin_set(gpio0_dev, NRF_GET_PIN(EPC901_READ_PIN), 0);
+    /* Step 5: Initial READ pulse — initiates CDS */
+    nrf_gpio_pin_set(PIN_READ);
+    k_usleep(1);
+    nrf_gpio_pin_clear(PIN_READ);
 
-    /* SAADC now captures 1024 samples autonomously via DPPI.
-     * capture_ready flag set by saadc_event_handler EVT_DONE. */
+    /* Step 6: Wait for CDS settling */
+    k_usleep(500);
+
+    /* Step 7: 3 preload clocks — discarded by SAADC (not yet running) */
+    for (int i = 0; i < PRELOAD_CLOCKS; i++) {
+        nrf_gpio_pin_set(PIN_READ);
+        k_usleep(1);
+        nrf_gpio_pin_clear(PIN_READ);
+        k_usleep(1);
+    }
+
+    /* Step 8: Enable TIMER22, then clock out 1024 pixels.
+     * Each rising edge of READ shifts out one pixel onto VIDEO_P.
+     * TIMER22 fires SAADC SAMPLE every 1 µs via DPPI. */
+    nrfx_timer_enable(&timer_instance);
+
+    for (int i = 0; i < PIXELS_PER_FRAME; i++) {
+        nrf_gpio_pin_set(PIN_READ);
+        k_usleep(1);
+        nrf_gpio_pin_clear(PIN_READ);
+        k_usleep(1);
+    }
+
+    return true;
 }
 
-/* --------------------------------------------------------------------------
- * CCCD Callback
- * -------------------------------------------------------------------------- */
+/* ==========================================================================
+ * Pack 1024 × 10-bit samples into 1280 bytes (little-endian bit packing)
+ *
+ * 4 pixels → 5 bytes:
+ *   byte 0 = px0[7:0]
+ *   byte 1 = px1[5:0] << 2 | px0[9:8]
+ *   byte 2 = px2[3:0] << 4 | px1[9:6]
+ *   byte 3 = px3[1:0] << 6 | px2[9:4]
+ *   byte 4 = px3[9:2]
+ *
+ * save_frames.py uses matching unpack_10bit().
+ * ========================================================================== */
+static void pack_10bit(const int16_t *samples, uint8_t *out, int num_pixels)
+{
+    int out_idx = 0;
+    for (int i = 0; i < num_pixels; i += 4) {
+        uint16_t p0 = (uint16_t)samples[i + 0] & 0x3FF;
+        uint16_t p1 = (uint16_t)samples[i + 1] & 0x3FF;
+        uint16_t p2 = (uint16_t)samples[i + 2] & 0x3FF;
+        uint16_t p3 = (uint16_t)samples[i + 3] & 0x3FF;
+
+        out[out_idx++] =  p0        & 0xFF;
+        out[out_idx++] = (p0 >> 8)  | ((p1 & 0x3F) << 2);
+        out[out_idx++] = (p1 >> 6)  | ((p2 & 0x0F) << 4);
+        out[out_idx++] = (p2 >> 4)  | ((p3 & 0x03) << 6);
+        out[out_idx++] =  p3 >> 2;
+    }
+}
+
+/* ==========================================================================
+ * BLE — GATT service
+ * Attribute layout:
+ *   [0] Primary service
+ *   [1] DATA characteristic declaration
+ *   [2] DATA characteristic value   ← bt_gatt_notify() target
+ *   [3] DATA CCCD
+ *   [4] CMD characteristic declaration
+ *   [5] CMD characteristic value    ← cmd_write() target
+ * ========================================================================== */
 static void epc901_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
     ble_ready = (value == BT_GATT_CCC_NOTIFY);
     LOG_INF("Notifications %s.", ble_ready ? "ENABLED" : "DISABLED");
 }
 
-/* --------------------------------------------------------------------------
- * CMD Characteristic Write Handler
- * -------------------------------------------------------------------------- */
 static ssize_t cmd_write(struct bt_conn *conn,
                          const struct bt_gatt_attr *attr,
                          const void *buf, uint16_t len,
                          uint16_t offset, uint8_t flags)
 {
-    if (len >= 1 && ((uint8_t *)buf)[0] == 0x01) {
+    if (len >= 1 && ((const uint8_t *)buf)[0] == 0x01) {
         capture_requested = true;
-        LOG_INF("Capture triggered.");
+        LOG_INF("Capture triggered via BLE CMD.");
     }
     return len;
 }
 
-/* --------------------------------------------------------------------------
- * GATT Service
- * Attribute index map:
- *   [0] Primary service declaration
- *   [1] DATA characteristic declaration
- *   [2] DATA characteristic value      <- notify here
- *   [3] DATA CCCD
- *   [4] CMD characteristic declaration
- *   [5] CMD characteristic value       <- write here
- * -------------------------------------------------------------------------- */
 BT_GATT_SERVICE_DEFINE(epc901_svc,
     BT_GATT_PRIMARY_SERVICE(BT_UUID_EPC901_SERVICE),
     BT_GATT_CHARACTERISTIC(BT_UUID_EPC901_DATA,
                            BT_GATT_CHRC_NOTIFY,
                            BT_GATT_PERM_NONE,
                            NULL, NULL, NULL),
-    BT_GATT_CCC(epc901_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CCC(epc901_ccc_cfg_changed,
+                BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
     BT_GATT_CHARACTERISTIC(BT_UUID_EPC901_CMD,
                            BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
                            BT_GATT_PERM_WRITE,
                            NULL, cmd_write, NULL),
 );
 
-/* --------------------------------------------------------------------------
+/* ==========================================================================
  * Burst Thread
  *
- * Flow per frame:
- *   1. Wait for capture_requested (set by CMD write from receiver)
- *   2. Abort any ongoing SAADC, re-arm buffers, re-trigger
- *   3. Run EPC901 capture sequence (CLR → integrate → SHUTTER → READ)
- *   4. Wait for capture_ready (set by SAADC EVT_DONE)
- *   5. Pack 1024 x 10-bit → 1280 bytes
- *   6. Transmit in BLE notifications
- * -------------------------------------------------------------------------- */
+ * Waits for capture_requested, runs EPC901 capture, packs pixels,
+ * sends 1280 bytes as BLE notifications (244 bytes per packet = 6 packets).
+ * ========================================================================== */
 void ble_burst_thread(void)
 {
     while (1) {
-        /* Wait for trigger */
+        /* Wait for trigger from receiver */
         while (!capture_requested) {
             k_sleep(K_MSEC(10));
         }
@@ -517,102 +458,84 @@ void ble_burst_thread(void)
             continue;
         }
 
-        /* Stop timer and abort any ongoing SAADC conversion */
-        nrfx_timer_disable(&timer_instance);
-        nrfx_saadc_abort();
-        k_sleep(K_MSEC(1));
-
-        /* Re-arm SAADC buffers */
-        capture_ready = false;
-        saadc_current_buffer = 0;
-
-        nrfx_err_t err = nrfx_saadc_buffer_set(saadc_buf[0], SAMPLES_PER_FRAME);
-        if (err != NRFX_SUCCESS) {
-            LOG_ERR("Re-arm buffer_set [0] error: 0x%08x", err);
-            continue;
-        }
-        err = nrfx_saadc_buffer_set(saadc_buf[1], SAMPLES_PER_FRAME);
-        if (err != NRFX_SUCCESS) {
-            LOG_ERR("Re-arm buffer_set [1] error: 0x%08x", err);
-            continue;
-        }
-        err = nrfx_saadc_mode_trigger();
-        if (err != NRFX_SUCCESS) {
-            LOG_ERR("Re-arm mode_trigger error: 0x%08x", err);
+        /* --- Arm SAADC --------------------------------------------------- */
+        if (!arm_saadc()) {
+            LOG_ERR("SAADC arm failed — skipping frame.");
             continue;
         }
 
-        /* Run EPC901 capture sequence — initiates SAADC via READ pulse */
-        epc901_start_capture();
+        /* --- EPC901 capture sequence ------------------------------------- */
+        LOG_INF("Starting EPC901 capture...");
+        if (!epc901_capture()) {
+            LOG_ERR("EPC901 capture failed — skipping frame.");
+            nrfx_saadc_abort();
+            nrfx_timer_disable(&timer_instance);
+            continue;
+        }
 
-        /* Wait for SAADC to fill one frame (1024 samples @ 1Msps = ~1ms)
-         * Timeout set generously to 500ms to account for integration time */
-        uint32_t timeout = 500;
+        /* --- Wait for SAADC to finish ------------------------------------ */
+        uint32_t timeout = 100;
         while (!capture_ready && timeout > 0) {
             k_sleep(K_MSEC(1));
             timeout--;
         }
+
         if (!capture_ready) {
-            LOG_ERR("SAADC capture timed out.");
+            LOG_ERR("SAADC capture timeout — skipping frame.");
+            nrfx_saadc_abort();
+            nrfx_timer_disable(&timer_instance);
             continue;
         }
 
-        /* Pack 1024 x 10-bit → 1280 bytes */
-        const int16_t *src = (const int16_t *)capture_buf;
-        size_t out_index = 0;
-        for (size_t i = 0; i < SAMPLES_PER_FRAME; i += 4) {
-            pack_four_10bit((uint16_t)src[i],   (uint16_t)src[i+1],
-                            (uint16_t)src[i+2], (uint16_t)src[i+3],
-                            &packed_buffer[out_index]);
-            out_index += 5;
+        /* --- Pack 1024 × 10-bit → 1280 bytes ---------------------------- */
+        pack_10bit((const int16_t *)capture_buf, packed_buf, PIXELS_PER_FRAME);
+
+        /* --- Transmit as BLE notifications ------------------------------ */
+    k_sleep(K_MSEC(200));
+
+    uint16_t offset   = 0;
+    int      packet   = 0;
+    bool     tx_ok    = true;
+    uint16_t pkt_size = BLE_PACKET_SIZE;   /* start with 244, fall back to 20 */
+
+    while (offset < PACKED_FRAME_BYTES) {
+        uint16_t chunk = MIN(pkt_size, PACKED_FRAME_BYTES - offset);
+
+        int err = bt_gatt_notify(current_conn,
+                                &epc901_svc.attrs[2],
+                                &packed_buf[offset],
+                                chunk);
+        if (err == -ENOMEM) {
+            if (pkt_size > 20) {
+                pkt_size = 20;
+                LOG_WRN("MTU fallback to 20-byte packets.");
+            }
+            k_sleep(K_MSEC(10));
+            continue;
         }
-        stats.frames_captured++;
-
-        /* Allow time for MTU negotiation to complete before sending */
-        k_sleep(K_MSEC(100));
-
-        /* Transmit in BLE notifications.
-         * Try preferred 244-byte packets first. Fall back to 20 bytes
-         * if MTU hasn't been negotiated yet. */
-        uint16_t tx_offset = 0;
-        bool send_error = false;
-
-        while (tx_offset < out_index) {
-            uint16_t pkt_size = MIN(BLE_PACKET_SIZE, out_index - tx_offset);
-
-            int ble_err = bt_gatt_notify(current_conn, &epc901_svc.attrs[2],
-                                         &packed_buffer[tx_offset], pkt_size);
-
-            if ((ble_err == -ENOMEM || ble_err == -ENOBUFS) &&
-                pkt_size > BLE_PACKET_SIZE_FALLBACK) {
-                pkt_size = BLE_PACKET_SIZE_FALLBACK;
-                ble_err = bt_gatt_notify(current_conn, &epc901_svc.attrs[2],
-                                         &packed_buffer[tx_offset], pkt_size);
-            }
-
-            if (ble_err) {
-                LOG_WRN("Notify error %d at offset %u", ble_err, tx_offset);
-                send_error = true;
-                break;
-            }
-
-            k_sleep(K_MSEC(2));
-            tx_offset += pkt_size;
+        if (err) {
+            LOG_ERR("Notify error %d at offset %u", err, offset);
+            tx_ok = false;
+            break;
         }
 
-        if (!send_error) {
-            stats.frames_transmitted++;
-            LOG_INF("Frame %u transmitted (%u bytes).",
-                    stats.frames_transmitted, (unsigned)out_index);
+        offset += chunk;
+        packet++;
+        k_sleep(K_MSEC(2));
+    }
+
+        if (tx_ok) {
+            LOG_INF("Frame transmitted: %d packets, %u bytes.",
+                    packet, offset);
         }
     }
 }
 
-K_THREAD_DEFINE(ble_burst_tid, 4096, ble_burst_thread, NULL, NULL, NULL, 7, 0, 0);
+K_THREAD_DEFINE(burst_tid, 4096, ble_burst_thread, NULL, NULL, NULL, 7, 0, 0);
 
-/* --------------------------------------------------------------------------
+/* ==========================================================================
  * Advertising
- * -------------------------------------------------------------------------- */
+ * ========================================================================== */
 static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
     BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_EPC901_SERVICE_VAL),
@@ -623,9 +546,23 @@ static const struct bt_data sd[] = {
             sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
-/* --------------------------------------------------------------------------
- * Connection Callbacks
- * -------------------------------------------------------------------------- */
+/* ==========================================================================
+ * Connection callbacks
+ * ========================================================================== */
+static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
+                             struct bt_gatt_exchange_params *params)
+{
+    if (err) {
+        LOG_WRN("MTU exchange failed (err %d)", err);
+    } else {
+        LOG_INF("MTU exchanged: %u", bt_gatt_get_mtu(conn));
+    }
+}
+
+static struct bt_gatt_exchange_params mtu_exchange_params = {
+    .func = mtu_exchange_cb,
+};
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
     if (err) {
@@ -633,19 +570,29 @@ static void connected(struct bt_conn *conn, uint8_t err)
         return;
     }
     current_conn = bt_conn_ref(conn);
-    LOG_INF("Connected. Waiting for CCCD subscription...");
+    LOG_INF("Receiver connected. Waiting for CCCD subscription...");
+
+    int mtu_err = bt_gatt_exchange_mtu(conn, &mtu_exchange_params);
+    if (mtu_err) {
+        LOG_WRN("MTU exchange request failed (err %d)", mtu_err);
+    }
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    LOG_INF("Disconnected (0x%02x). Returning to advertising.", reason);
-    ble_ready = false;
-    capture_requested = false;
+    LOG_INF("Disconnected (0x%02x). Restarting advertising.", reason);
     if (current_conn) {
         bt_conn_unref(current_conn);
         current_conn = NULL;
     }
-    bt_le_adv_start(BT_LE_ADV_CONN_ONE_TIME, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    ble_ready         = false;
+    capture_requested = false;
+
+    int err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad),
+                               sd, ARRAY_SIZE(sd));
+    if (err) {
+        LOG_ERR("Advertising restart failed (err %d)", err);
+    }
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -653,28 +600,42 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
     .disconnected = disconnected,
 };
 
-/* --------------------------------------------------------------------------
+/* ==========================================================================
  * Main
- * -------------------------------------------------------------------------- */
+ * ========================================================================== */
 int main(void)
 {
+    LOG_INF("========================================");
+    LOG_INF("  EPC901 BLE Transmitter — nRF54L15    ");
+    LOG_INF("========================================");
+
+    configure_digital_pins();
     configure_timer();
     configure_saadc();
     configure_ppi();
 
-    /* EPC901 hardware init
-     * These will log errors if the PCB is not yet connected — that is expected
-     * until the EPC901 is soldered and wired up. */
-    epc901_gpio_init();
-    epc901_i2c_init();
-
-    if (bt_enable(NULL)) {
-        LOG_ERR("Bluetooth init failed");
-        return 0;
+    int err = bt_enable(NULL);
+    if (err) {
+        LOG_ERR("bt_enable failed (err %d)", err);
+        return -1;
     }
 
-    bt_le_adv_start(BT_LE_ADV_CONN_ONE_TIME, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-    LOG_INF("Transmitter ready. Advertising as EPC901_TX.");
+    err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad),
+                           sd, ARRAY_SIZE(sd));
+    if (err) {
+        LOG_ERR("Advertising start failed (err %d)", err);
+        return -1;
+    }
+
+    LOG_INF("Advertising as EPC901_TX. Waiting for receiver...");
+
+    /* Burst thread handles everything — main just keeps the system alive */
+    while (1) {
+        k_sleep(K_SECONDS(10));
+        LOG_INF("Heartbeat — conn=%s ble_ready=%s",
+                current_conn ? "yes" : "no",
+                ble_ready    ? "yes" : "no");
+    }
 
     return 0;
 }

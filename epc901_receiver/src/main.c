@@ -16,8 +16,8 @@
 #include <zephyr/drivers/uart.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
-#include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>   
 
 LOG_MODULE_REGISTER(EPC901_Receiver, LOG_LEVEL_INF);
 
@@ -405,24 +405,16 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
     bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
     LOG_INF("Found EPC901_TX at %s (RSSI %d). Connecting...", addr_str, rssi);
 
-    int err = bt_le_scan_stop();
-    if (err) {
-        LOG_ERR("Scan stop failed (err %d)", err);
-        return;
-    }
+    bt_le_scan_stop();
 
-    /* Clear any stale connection reference before creating a new one */
-    if (default_conn) {
-        bt_conn_unref(default_conn);
-        default_conn = NULL;
-    }
-
-    err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
-                            BT_LE_CONN_PARAM_DEFAULT, &default_conn);
+    struct bt_conn *conn = NULL;
+    int err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
+                                BT_LE_CONN_PARAM_DEFAULT, &conn);
     if (err) {
         LOG_ERR("Connection create failed (err %d)", err);
-        default_conn = NULL;
         bt_le_scan_start(BT_LE_SCAN_PASSIVE, device_found);
+    } else {
+        default_conn = conn;
     }
 }
 
