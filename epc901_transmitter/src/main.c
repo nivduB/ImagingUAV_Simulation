@@ -59,14 +59,14 @@ LOG_MODULE_REGISTER(EPC901_TX, LOG_LEVEL_INF);
 /* ==========================================================================
  * Pin definitions
  * ========================================================================== */
-#define NRF_SAADC_INPUT_AIN4   NRF_PIN_PORT_TO_PIN_NUMBER(11U, 1)
+#define NRF_SAADC_INPUT_AIN4   NRF_PIN_PORT_TO_PIN_NUMBER(11U, 1)  /* P1.11 — analog input for VIDEO_P (EPC901 pixel output) */
 
-#define PIN_DATA_RDY   NRF_GPIO_PIN_MAP(1, 10)
-#define PIN_READ       NRF_GPIO_PIN_MAP(1, 12)
-#define PIN_CLR_PIX    NRF_GPIO_PIN_MAP(2, 6)
-#define PIN_SHUTTER    NRF_GPIO_PIN_MAP(2, 8)
-#define PIN_CLR_DATA   NRF_GPIO_PIN_MAP(2, 9)
-#define PIN_PWR_DOWN   NRF_GPIO_PIN_MAP(2, 10)
+#define PIN_DATA_RDY   NRF_GPIO_PIN_MAP(1, 10)  /* P1.10 — input:  EPC901 signals frame is ready to read out */
+#define PIN_READ       NRF_GPIO_PIN_MAP(1, 12)  /* P1.12 — output: pulse to clock out each pixel onto VIDEO_P */
+#define PIN_CLR_PIX    NRF_GPIO_PIN_MAP(2, 6)   /* P2.06 — output: resets the pixel array before each exposure */
+#define PIN_SHUTTER    NRF_GPIO_PIN_MAP(2, 8)   /* P2.08 — output: HIGH=expose, LOW=end exposure and freeze frame */
+#define PIN_CLR_DATA   NRF_GPIO_PIN_MAP(2, 9)   /* P2.09 — output: clears the data register before each capture */
+#define PIN_PWR_DOWN   NRF_GPIO_PIN_MAP(2, 10)  /* P2.10 — output: LOW=sensor active, HIGH=sensor powered down */
 
 /* ==========================================================================
  * Config
