@@ -13,15 +13,18 @@
  *   5. Burst thread packs 1024 × 10-bit → 1280 bytes
  *   6. Sends 1280 bytes as BLE notifications (244 bytes per packet)
  *
- * Wiring:
- *   DATA_RDY  → P1.10  (J1 pin 5)
- *   VIDEO_P   → P1.11  (J1 pin 4)   AIN4
- *   READ      → P1.12  (J1 pin 8)
- *   CLR_PIX   → P2.06  (J1 pin 7)
- *   SHUTTER   → P2.08  (J1 pin 9)
- *   CLR_DATA  → P2.09  (J2 pin 3)
- *   PWR_DOWN  → P2.10  (J2 pin 1)
- *   GND       → GND    (J1 pin 10)
+ * Wiring — nRF54L15 DK to EPC901 PCB:
+ *
+ *   nRF54L15 Pin   Connector     Signal       Direction
+ *   ─────────────────────────────────────────────────────
+ *   P1.10          J1 pin 5      DATA_RDY     INPUT
+ *   P1.11 (AIN4)   J1 pin 4      VIDEO_P      INPUT (analog)
+ *   P1.12          J1 pin 8      READ         OUTPUT
+ *   P2.06          J1 pin 7      CLR_PIX      OUTPUT
+ *   P2.08          J1 pin 9      SHUTTER      OUTPUT
+ *   P2.09          J2 pin 3      CLR_DATA     OUTPUT
+ *   P2.10          J2 pin 1      PWR_DOWN     OUTPUT
+ *   GND            J1 pin 10     GND          POWER
  */
 
 #include <zephyr/kernel.h>
