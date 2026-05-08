@@ -123,11 +123,19 @@ static void uart_trigger_thread(void)
     while (1) {
         uint8_t c;
         if (uart_poll_in(uart_dev, &c) == 0) {
-            if (c == 0x54) {
-                LOG_INF("Trigger byte received from PC.");
-                send_ble_trigger();
+            if (c == 0x01 || c == 0x02) {
+                LOG_INF("CMD 0x%02x received from PC.", c);
+                uint8_t trigger = c;
+                int err = bt_gatt_write_without_response(default_conn, cmd_handle,
+                                                        &trigger, sizeof(trigger), false);
+                if (err) {
+                    LOG_ERR("BLE CMD write failed (err %d)", err);
+                } else {
+                    stats.triggers_sent++;
+                    LOG_INF("CMD 0x%02x sent to transmitter.", c);
+                }
             }
-        }
+                    }
         k_sleep(K_MSEC(1));
     }
 }

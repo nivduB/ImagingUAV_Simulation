@@ -1,19 +1,21 @@
 """
-EPC901 Frame Capture — triggered mode.
+EPC901 Polar Frame Capture — RAM buffer mode.
 
 Flow:
-  1. Press Enter (or set --auto) to capture a row
-  2. Python sends 0x54 ('T') over serial to receiver
-  3. Receiver forwards as BLE write to transmitter CMD characteristic
-  4. Transmitter captures one frame and sends it back as BLE notifications
-  5. Python receives framed binary packets, reassembles, unpacks, saves
+  1. Press S → sends 0x01 to transmitter → starts capturing to RAM
+  2. Sensor captures 108 frames at ~6,500 fps (one full rotation at 60Hz)
+  3. Press D → sends 0x02 to transmitter → dumps all frames over BLE
+  4. Python receives 108 × 1024 bytes, saves as .npy files
+  5. Run plot_polar.py to reconstruct 360° image
 
 UART frame format from receiver:
   [0xAA] [0x55] [len_lo] [len_hi] [data...]
 
+Each frame = 1024 raw 8-bit bytes (no unpacking needed).
+
 Usage:
   python3 save_frames.py
-  python3 save_frames.py --auto --rows 100 --interval 0.5
+  python3 save_frames.py --port /dev/tty.usbmodem0010507939193
 """
 
 import serial
@@ -22,38 +24,29 @@ import os
 import shutil
 import argparse
 import time
+import sys
+import select
 
 # --- Config ---
-PORT             = '/dev/tty.usbmodem0010507939193'  # receiver port
+PORT             = '/dev/tty.usbmodem0010507939193'
 BAUD             = 115200
 PIXELS_PER_FRAME = 1024
-BYTES_PER_FRAME  = PIXELS_PER_FRAME * 10 // 8        # 1280 bytes
+BYTES_PER_FRAME  = 1024   # 8-bit pixels — 1 byte per pixel
+MAX_FRAMES       = 108
 OUTPUT_DIR       = 'frames'
 
-# Clear frames folder at start of every run
-if os.path.exists(OUTPUT_DIR) and os.listdir(OUTPUT_DIR):
-    confirm = input(f"Clear {len(os.listdir(OUTPUT_DIR))} existing frames? (y/n): ")
-    if confirm.lower() == 'y':
-        shutil.rmtree(OUTPUT_DIR)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def clear_frames_dir():
+    if os.path.exists(OUTPUT_DIR) and os.listdir(OUTPUT_DIR):
+        confirm = input(f"Clear {len(os.listdir(OUTPUT_DIR))} existing frames? (y/n): ")
+        if confirm.lower() == 'y':
+            shutil.rmtree(OUTPUT_DIR)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def unpack_10bit(packed: bytes) -> np.ndarray:
-    """Unpack 10-bit packed pixel data into uint16 array."""
-    pixels = []
-    for i in range(0, len(packed) - 4, 5):
-        b0, b1, b2, b3, b4 = packed[i:i+5]
-        pixels.append( b0        | ((b1 & 0x03) << 8))
-        pixels.append(((b1 >> 2) | ((b2 & 0x0F) << 6)) & 0x3FF)
-        pixels.append(((b2 >> 4) | ((b3 & 0x3F) << 4)) & 0x3FF)
-        pixels.append(((b3 >> 6) | ( b4          << 2)) & 0x3FF)
-    return np.array(pixels[:PIXELS_PER_FRAME], dtype=np.uint16)
-
-
-def read_packet(ser: serial.Serial, timeout_s: float = 5.0) -> bytes | None:
+def read_packet(ser: serial.Serial, timeout_s: float = 10.0) -> bytes | None:
     """
     Scan stream for 0xAA 0x55 sync marker, read length-prefixed payload.
-    Returns payload bytes or None on timeout/error.
     """
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -74,7 +67,7 @@ def read_packet(ser: serial.Serial, timeout_s: float = 5.0) -> bytes | None:
 
 
 def collect_frame(ser: serial.Serial) -> np.ndarray | None:
-    """Collect packets until a full frame (1280 bytes) is assembled."""
+    """Collect packets until a full 1024-byte frame is assembled."""
     frame_buffer = bytearray()
     while len(frame_buffer) < BYTES_PER_FRAME:
         packet = read_packet(ser)
@@ -83,80 +76,99 @@ def collect_frame(ser: serial.Serial) -> np.ndarray | None:
             return None
         frame_buffer.extend(packet)
 
-    return unpack_10bit(bytes(frame_buffer[:BYTES_PER_FRAME]))
+    # Raw 8-bit pixels — no unpacking needed
+    return np.frombuffer(bytes(frame_buffer[:BYTES_PER_FRAME]), dtype=np.uint8).copy()
 
 
-def trigger_capture(ser: serial.Serial):
-    """Send trigger byte to receiver."""
-    ser.write(b'\x54')  # 'T'
+def send_start(ser: serial.Serial):
+    """Send 0x01 — start continuous capture to RAM."""
+    ser.write(b'\x01')
     ser.flush()
+    print(">>> Sent START (0x01) — sensor capturing to RAM...")
 
 
-def save_frame(pixels: np.ndarray, row_num: int) -> str:
-    path = os.path.join(OUTPUT_DIR, f"frame_{row_num:05d}.npy")
+def send_stop(ser: serial.Serial):
+    """Send 0x02 — stop capture and dump all frames over BLE."""
+    ser.write(b'\x02')
+    ser.flush()
+    print(">>> Sent STOP (0x02) — waiting for BLE dump...")
+
+
+def save_frame(pixels: np.ndarray, frame_num: int) -> str:
+    path = os.path.join(OUTPUT_DIR, f"frame_{frame_num:05d}.npy")
     np.save(path, pixels)
     return path
 
 
+def kbhit():
+    """Non-blocking check if a key was pressed."""
+    return select.select([sys.stdin], [], [], 0)[0] != []
+
+
 def main():
-    parser = argparse.ArgumentParser(description='EPC901 frame capture')
-    parser.add_argument('--auto',     action='store_true',
-                        help='Auto-trigger at fixed interval')
-    parser.add_argument('--rows',     type=int,   default=100,
-                        help='Number of rows to capture in auto mode (default 100)')
-    parser.add_argument('--interval', type=float, default=0.5,
-                        help='Seconds between auto triggers (default 0.5)')
-    parser.add_argument('--port',     type=str,   default=PORT,
-                        help='Serial port')
+    parser = argparse.ArgumentParser(description='EPC901 polar frame capture')
+    parser.add_argument('--port', type=str, default=PORT, help='Serial port')
     args = parser.parse_args()
+
+    clear_frames_dir()
 
     ser = serial.Serial(args.port, BAUD, rtscts=False, dsrdtr=False, timeout=1)
     print(f"Connected to {args.port}")
     print(f"Saving to ./{OUTPUT_DIR}/")
-    print(f"Mode: {'AUTO (' + str(args.rows) + ' rows @ ' + str(args.interval) + 's)' if args.auto else 'MANUAL (press Enter per row)'}\n")
+    print()
+    print("Controls:")
+    print("  S + Enter → start capture (spin the sensor first)")
+    print("  D + Enter → stop capture and dump frames over BLE")
+    print("  Ctrl+C    → exit")
+    print()
 
-    row_num = 0
+    frame_num   = 0
+    capturing   = False
+    dumping     = False
 
-    if args.auto:
-        for row_num in range(args.rows):
-            print(f"Triggering row {row_num}...", end=' ', flush=True)
-            trigger_capture(ser)
-
-            pixels = collect_frame(ser)
-            if pixels is None:
-                print(f"FAILED — skipping row {row_num}")
-                continue
-
-            path = save_frame(pixels, row_num)
-            print(f"min={pixels.min():4d}  max={pixels.max():4d}  "
-                  f"mean={pixels.mean():6.1f}  → {path}")
-
-            time.sleep(args.interval)
-
-        print(f"\nDone. {args.rows} rows captured.")
-
-    else:
-        # Manual mode — press Enter to trigger each row
-        print("Press Enter to capture each row. Ctrl+C to stop.\n")
+    try:
         while True:
-            try:
-                input(f"Row {row_num} — press Enter to capture...")
-            except KeyboardInterrupt:
-                print(f"\nStopped. {row_num} rows saved.")
-                break
+            # Check for keypress
+            cmd = input("Command (S=start, D=dump): ").strip().upper()
 
-            trigger_capture(ser)
-            print(f"  Capturing...", end=' ', flush=True)
+            if cmd == 'S':
+                send_start(ser)
+                capturing = True
+                dumping   = False
+                frame_num = 0
 
-            pixels = collect_frame(ser)
-            if pixels is None:
-                print("FAILED — try again")
-                continue
+            elif cmd == 'D':
+                if not capturing:
+                    print("Not currently capturing — start first with S.")
+                    continue
+                send_stop(ser)
+                capturing = False
+                dumping   = True
 
-            path = save_frame(pixels, row_num)
-            print(f"min={pixels.min():4d}  max={pixels.max():4d}  "
-                  f"mean={pixels.mean():6.1f}  → {path}")
-            row_num += 1
+                print(f"Receiving up to {MAX_FRAMES} frames...")
+                start_time = time.time()
+
+                while frame_num < MAX_FRAMES:
+                    pixels = collect_frame(ser)
+                    if pixels is None:
+                        print(f"  Timeout after {frame_num} frames.")
+                        break
+
+                    path = save_frame(pixels, frame_num)
+                    print(f"  frame {frame_num:03d} — "
+                          f"min={pixels.min():3d} max={pixels.max():3d} "
+                          f"mean={pixels.mean():5.1f} → {path}")
+                    frame_num += 1
+
+                elapsed = time.time() - start_time
+                print(f"\nReceived {frame_num} frames in {elapsed:.2f}s.")
+                print("Run: python3 plot_polar.py")
+                dumping = False
+
+    except KeyboardInterrupt:
+        print(f"\nStopped. {frame_num} frames saved.")
+    finally:
+        ser.close()
 
 
 if __name__ == '__main__':
