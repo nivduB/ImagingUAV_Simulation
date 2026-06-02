@@ -3,12 +3,23 @@
  * nRF5340 / nRF Connect SDK v3.1.1
  *
  * Protocol:
- *   PC → UART → receiver (0x54 'T') → BLE write → transmitter CMD char
- *   Transmitter captures 1024 samples, packs 10-bit, sends BLE notifications
- *   Receiver forwards each notification payload to PC as:
- *     [0xAA] [0x55] [len_lo] [len_hi] [packed_data...]
+ *   PC → UART → receiver (0x01 / 0x02) → BLE write → transmitter CMD char
+ *     0x01 → start continuous capture to RAM
+ *     0x02 → stop capture and dump all frames over BLE
  *
- * save_frames.py on PC reassembles packets into full frames and unpacks.
+ *   Transmitter captures 108 × 1024 8-bit pixels into RAM, then on CMD 0x02
+ *   dumps each frame over BLE as stride-3 subsampled packets (342 bytes/frame).
+ *
+ *   Receiver is a pure pass-through: each BLE notification payload is
+ *   forwarded to the PC as-is with a 4-byte framing header:
+ *     [0xAA] [0x55] [len_lo] [len_hi] [data...]
+ *
+ *   save_frames.py on the PC reassembles packets into full 342-byte frames
+ *   (stride-3 subsampled from 1024 pixels) and saves them as .npy files.
+ *
+ * Note: the receiver has no knowledge of frame size or subsampling stride.
+ *   It forwards each BLE notification packet verbatim. Frame boundary
+ *   detection and reassembly happen entirely in save_frames.py.
  */
 
 #include <zephyr/kernel.h>
@@ -17,7 +28,7 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/uuid.h>
-#include <zephyr/bluetooth/gatt.h>   
+#include <zephyr/bluetooth/gatt.h>
 
 LOG_MODULE_REGISTER(EPC901_Receiver, LOG_LEVEL_INF);
 
@@ -69,11 +80,14 @@ static void uart_write_bytes(const uint8_t *buf, size_t len)
     }
 }
 
-
 /* --------------------------------------------------------------------------
  * Forward BLE notification payload to PC with 0xAA 0x55 framing.
  * save_frames.py expects: [0xAA] [0x55] [len_lo] [len_hi] [data...]
- * The data is raw packed 10-bit bytes — save_frames.py unpacks on the PC.
+ *
+ * The receiver is frame-agnostic: it forwards each BLE notification packet
+ * verbatim. Packets are up to 244 bytes (MTU 247 − 3 ATT overhead).
+ * save_frames.py accumulates packets until 342 bytes are collected per frame
+ * (stride-3 subsampled 8-bit pixels from the transmitter).
  * -------------------------------------------------------------------------- */
 static void forward_packet_to_uart(const uint8_t *data, uint16_t length)
 {
@@ -91,51 +105,34 @@ static void forward_packet_to_uart(const uint8_t *data, uint16_t length)
 }
 
 /* --------------------------------------------------------------------------
- * Send capture trigger to transmitter via BLE write to CMD characteristic.
- * Transmitter expects 0x01 to start one frame capture.
- * -------------------------------------------------------------------------- */
-static void send_ble_trigger(void)
-{
-    if (!default_conn || !cmd_handle) {
-        LOG_WRN("Cannot trigger — not connected or CMD handle unknown.");
-        return;
-    }
-
-    uint8_t trigger = 0x01;
-    int err = bt_gatt_write_without_response(default_conn, cmd_handle,
-                                             &trigger, sizeof(trigger), false);
-    if (err) {
-        LOG_ERR("BLE trigger write failed (err %d)", err);
-    } else {
-        stats.triggers_sent++;
-        LOG_INF("Trigger sent (%u total).", stats.triggers_sent);
-    }
-}
-
-/* --------------------------------------------------------------------------
- * UART Trigger Thread
- * Polls UART for 0x54 ('T') from save_frames.py and fires BLE trigger.
+ * UART Command Thread
+ * Polls UART for 0x01 (start capture) or 0x02 (stop + dump) from
+ * save_frames.py and forwards the byte verbatim to the transmitter CMD char.
  * -------------------------------------------------------------------------- */
 static void uart_trigger_thread(void)
 {
-    LOG_INF("UART trigger thread started. Waiting for 0x54 ('T')...");
+    LOG_INF("UART command thread started. Waiting for 0x01 / 0x02 from PC...");
 
     while (1) {
         uint8_t c;
         if (uart_poll_in(uart_dev, &c) == 0) {
             if (c == 0x01 || c == 0x02) {
-                LOG_INF("CMD 0x%02x received from PC.", c);
-                uint8_t trigger = c;
-                int err = bt_gatt_write_without_response(default_conn, cmd_handle,
-                                                        &trigger, sizeof(trigger), false);
-                if (err) {
-                    LOG_ERR("BLE CMD write failed (err %d)", err);
+                if (!default_conn || !cmd_handle) {
+                    LOG_WRN("CMD 0x%02x received but not connected.", c);
                 } else {
-                    stats.triggers_sent++;
-                    LOG_INF("CMD 0x%02x sent to transmitter.", c);
+                    int err = bt_gatt_write_without_response(default_conn,
+                                                             cmd_handle,
+                                                             &c, sizeof(c),
+                                                             false);
+                    if (err) {
+                        LOG_ERR("BLE CMD 0x%02x write failed (err %d)", c, err);
+                    } else {
+                        stats.triggers_sent++;
+                        LOG_INF("CMD 0x%02x forwarded to transmitter.", c);
+                    }
                 }
             }
-                    }
+        }
         k_sleep(K_MSEC(1));
     }
 }
@@ -146,7 +143,7 @@ K_THREAD_DEFINE(uart_trigger_tid, 1024,
 
 /* --------------------------------------------------------------------------
  * BLE Notification Handler
- * Forward raw packed payload directly to PC — no unpack/repack needed.
+ * Forward raw payload directly to PC — no frame reassembly here.
  * -------------------------------------------------------------------------- */
 static uint8_t notify_handler(struct bt_conn *conn,
                                struct bt_gatt_subscribe_params *params,
@@ -243,7 +240,6 @@ static uint8_t discover_ccc_func(struct bt_conn *conn,
         return BT_GATT_ITER_STOP;
     }
 
-    /* Filter for CCC UUID specifically */
     if (bt_uuid_cmp(attr->uuid, BT_UUID_GATT_CCC) == 0) {
         ccc_handle = attr->handle;
         LOG_INF("Found CCC descriptor (handle %u).", ccc_handle);
@@ -327,6 +323,7 @@ static void start_discovery(struct bt_conn *conn)
         LOG_ERR("Service discovery failed (err %d)", err);
     }
 }
+
 /* Forward declaration */
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
                          struct net_buf_simple *ad);
@@ -455,7 +452,7 @@ int main(void)
 
     while (1) {
         k_sleep(K_SECONDS(10));
-        LOG_INF("Status — triggers: %u, packets: %u, bytes: %u",
+        LOG_INF("Status — cmds sent: %u, packets forwarded: %u, bytes: %u",
                 stats.triggers_sent,
                 stats.packets_forwarded,
                 stats.bytes_forwarded);

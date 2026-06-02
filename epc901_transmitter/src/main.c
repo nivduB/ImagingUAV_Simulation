@@ -9,19 +9,24 @@
  * Capture pipeline per frame:
  *   CLR_PIX → CLR_DATA → SHUTTER (26µs) → wait DATA_RDY →
  *   READ pulse (CDS) → 3 preload clocks → TIMER22 enable →
- *   GPIOTE hardware-toggles READ at 1MHz → SAADC samples VIDEO_P →
+ *   GPIOTE hardware-toggles READ at 2MHz → SAADC samples VIDEO_P at 2Msps →
  *   EVT_DONE → store 1024 × 8-bit pixels in RAM frame buffer
  *
-* RAM buffer:
+ * SAADC runs at 2 Msps (CC[0] = 0.5µs), cutting readout time from
+ * 1.024 ms → 512 µs per frame. All 1024 pixels are always clocked out
+ * via READ (EPC901 is a shift register — pixels cannot be skipped).
+ * Stride-based subsampling (every 3rd pixel → 342 bytes) is applied
+ * only during the BLE dump to reduce over-the-air transfer time.
+ *
+ * RAM buffer:
  *   108 frames × 1024 pixels × 1 byte = 110,592 bytes (~108 KB)
- *   At 60Hz rotation and ~1.2ms/frame:
- *     ~7.7 rotations to fill buffer
+ *   At 60Hz rotation and ~0.712ms/frame (512µs capture + 200µs overhead):
+ *     ~84 rotations to fill buffer
  *     ~14 unique angular positions → ~25.9° angular resolution
  *   Python maps frames evenly 0°→360° for polar reconstruction
- * 
- * 
- * BLE dump after rotation:
- *   110,592 bytes ÷ 244 bytes/packet = 453 packets → ~0.9 seconds
+ *
+ * BLE dump after rotation (stride=3, 342 bytes/frame):
+ *   108 × 342 = 36,936 bytes ÷ 244 bytes/packet ≈ 152 packets → ~0.3 seconds
  *
  * Wiring — nRF54L15 DK to EPC901 PCB:
  *
@@ -86,16 +91,25 @@ LOG_MODULE_REGISTER(EPC901_TX, LOG_LEVEL_INF);
  * Config
  * ========================================================================== */
 #define PIXELS_PER_FRAME      1024
-#define BYTES_PER_FRAME       1024   /* 8-bit pixels — 1 byte per pixel */
+#define BYTES_PER_FRAME       1024   /* 8-bit pixels — 1 byte per pixel (full capture) */
 #define MAX_FRAMES             108   /* one full rotation at 60Hz */
 #define BLE_PACKET_SIZE        244   /* MTU 247 − 3 bytes ATT overhead */
 #define PRELOAD_CLOCKS           3
 #define TIMER_INSTANCE_NUMBER   22
 #define EXPOSURE_US             26   /* minimum EPC901 exposure time */
-/* At 60Hz, one frame every 154µs.
- * Since capture takes ~3ms, no extra delay needed —
- * just remove the 1ms delay in arm_saadc() instead. */
-#define FRAME_INTERVAL_US  0
+
+/* Stride-based subsampling for BLE dump only.
+ * All 1024 pixels are always captured (EPC901 shift register requires all
+ * 1024 READ pulses — pixels cannot be skipped). Only every PIXEL_STRIDE-th
+ * pixel is transmitted over BLE to reduce dump time.
+ * PIXEL_STRIDE=3 → 342 pixels per frame sent over BLE. */
+#define PIXEL_STRIDE             3
+#define BLE_PIXELS_PER_FRAME   ((PIXELS_PER_FRAME + PIXEL_STRIDE - 1) / PIXEL_STRIDE)  /* 342 */
+
+/* At 2Msps, readout = 512µs per frame (down from 1.024ms at 1Msps).
+ * No extra inter-frame delay needed. */
+#define FRAME_INTERVAL_US        0
+
 /* ==========================================================================
  * SAADC / Timer globals
  * ========================================================================== */
@@ -168,11 +182,18 @@ static void configure_digital_pins(void)
 }
 
 /* ==========================================================================
- * Timer
+ * Timer — 2 MHz READ clock (up from 1 MHz)
  *
- * CC[0] = 1 µs  → fires SAADC SAMPLE + READ SET (rising edge)
- * CC[1] = 0.5µs → fires READ CLR (falling edge, half-period)
- * Timer auto-clears on CC[0] → 1 MHz square wave on READ
+ * CC[0] = 0.5µs → fires SAADC SAMPLE + READ SET (rising edge)
+ * CC[1] = 0.25µs → fires READ CLR (falling edge, half-period)
+ * Timer auto-clears on CC[0] → 2 MHz square wave on READ
+ *
+ * At 16 MHz timer clock:
+ *   CC[0] = 8 ticks = 0.5µs → 2 MHz period
+ *   CC[1] = 4 ticks = 0.25µs → READ falls at mid-period
+ *
+ * Readout time: 1024 pixels ÷ 2 MHz = 512 µs per frame
+ * (vs. 1.024 ms at 1 MHz)
  * ========================================================================== */
 static void configure_timer(void)
 {
@@ -183,21 +204,21 @@ static void configure_timer(void)
         return;
     }
 
-    /* CC[0] = 16 ticks = 1 µs — auto-clear → 1 MHz period */
-    uint32_t ticks = nrfx_timer_us_to_ticks(&timer_instance, 1);
+    /* CC[0] = 8 ticks = 0.5µs — auto-clear → 2 MHz period */
+    uint32_t ticks = nrfx_timer_us_to_ticks(&timer_instance, 1) / 2;
     nrfx_timer_extended_compare(&timer_instance,
                                  NRF_TIMER_CC_CHANNEL0,
                                  ticks,
                                  NRF_TIMER_SHORT_COMPARE0_CLEAR_MASK,
                                  false);
 
-    /* CC[1] = 8 ticks = 0.5 µs — READ falls at mid-period */
+    /* CC[1] = 4 ticks = 0.25µs — READ falls at mid-period */
     nrfx_timer_compare(&timer_instance,
                         NRF_TIMER_CC_CHANNEL1,
                         ticks / 2,
                         false);
 
-    LOG_INF("TIMER22 configured: CC[0]=%u ticks (1MHz), CC[1]=%u ticks (0.5MHz)",
+    LOG_INF("TIMER22 configured: CC[0]=%u ticks (2MHz), CC[1]=%u ticks (0.25us)",
             ticks, ticks / 2);
 }
 
@@ -232,7 +253,7 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 }
 
 /* ==========================================================================
- * SAADC init
+ * SAADC init — 2 Msps (driven by 2 MHz TIMER22 via DPPI)
  * ========================================================================== */
 static void configure_saadc(void)
 {
@@ -267,7 +288,7 @@ static void configure_saadc(void)
         return;
     }
 
-    LOG_INF("SAADC configured (AIN4, 10-bit, 1 Msps).");
+    LOG_INF("SAADC configured (AIN4, 10-bit, 2 Msps via 2MHz TIMER22).");
 }
 
 /* ==========================================================================
@@ -367,7 +388,7 @@ static void configure_gpiote_read(void)
         nrfx_gpiote_clr_task_address_get(gpiote_inst, PIN_READ));
     nrfx_gppi_channels_enable(BIT(ppi_timer_to_read_clr));
 
-    LOG_INF("GPIOTE READ clock configured (hardware 1MHz toggle on P1.12).");
+    LOG_INF("GPIOTE READ clock configured (hardware 2MHz toggle on P1.12).");
 }
 
 /* ==========================================================================
@@ -377,7 +398,6 @@ static bool arm_saadc(void)
 {
     nrfx_saadc_abort();
     k_usleep(10);
-
 
     capture_ready        = false;
     capture_buf          = NULL;
@@ -447,7 +467,7 @@ static bool epc901_capture(void)
         k_usleep(1);
     }
 
-    /* Hand off to hardware */
+    /* Hand off to hardware — 2MHz READ clock clocks out all 1024 pixels */
     nrfx_timer_enable(&timer_instance);
     return true;
 }
@@ -455,13 +475,14 @@ static bool epc901_capture(void)
 /* ==========================================================================
  * Convert 10-bit SAADC samples to 8-bit pixels and store in frame buffer.
  * Shifts right by 2 to drop the 2 LSBs: 0-1023 → 0-255.
+ * All 1024 pixels are stored — subsampling happens at BLE dump time only.
  * ========================================================================== */
 static void store_frame_8bit(const int16_t *samples, uint32_t frame_idx)
 {
     uint8_t *dst = frame_buffer[frame_idx];
     for (int i = 0; i < PIXELS_PER_FRAME; i++) {
         int16_t val = samples[i];
-        if (val < 0)   val = 0;
+        if (val < 0)    val = 0;
         if (val > 1023) val = 1023;
         dst[i] = (uint8_t)(val >> 2);   /* 10-bit → 8-bit */
     }
@@ -471,7 +492,13 @@ extern const struct bt_gatt_service_static epc901_svc;
 
 /* ==========================================================================
  * Dump all captured frames over BLE.
- * Each frame is sent as raw 8-bit bytes, 1024 bytes per frame.
+ *
+ * Stride-based subsampling: every PIXEL_STRIDE-th pixel is sent (342 pixels
+ * per frame instead of 1024). The EPC901 shift register already clocked out
+ * all 1024 pixels during capture — no pixels were skipped there. This stride
+ * only reduces BLE transfer volume.
+ *
+ * Each frame is sent as raw 8-bit bytes in chunks up to BLE_PACKET_SIZE.
  * Receiver forwards to Python which reassembles into polar image.
  * ========================================================================== */
 static void dump_frames_ble(void)
@@ -481,20 +508,32 @@ static void dump_frames_ble(void)
         return;
     }
 
-    LOG_INF("Dumping %u frames over BLE...", frames_captured);
+    LOG_INF("Dumping %u frames over BLE (stride=%d, %d pixels/frame)...",
+            frames_captured, PIXEL_STRIDE, BLE_PIXELS_PER_FRAME);
+
+    /* Scratch buffer for one subsampled frame */
+    static uint8_t ble_frame[BLE_PIXELS_PER_FRAME];
 
     uint32_t total_bytes = 0;
 
     for (uint32_t f = 0; f < frames_captured; f++) {
+
+        /* Build the subsampled frame — every PIXEL_STRIDE-th pixel */
+        uint32_t out_idx = 0;
+        for (int i = 0; i < PIXELS_PER_FRAME; i += PIXEL_STRIDE) {
+            ble_frame[out_idx++] = frame_buffer[f][i];
+        }
+        /* out_idx == BLE_PIXELS_PER_FRAME at this point */
+
         uint16_t offset   = 0;
         bool     frame_ok = true;
 
-        while (offset < BYTES_PER_FRAME) {
-            uint16_t chunk = MIN(BLE_PACKET_SIZE, BYTES_PER_FRAME - offset);
+        while (offset < BLE_PIXELS_PER_FRAME) {
+            uint16_t chunk = MIN(BLE_PACKET_SIZE, BLE_PIXELS_PER_FRAME - offset);
 
             int err = bt_gatt_notify(current_conn,
                                      &epc901_svc.attrs[2],
-                                     &frame_buffer[f][offset],
+                                     &ble_frame[offset],
                                      chunk);
             if (err == -ENOMEM) {
                 k_sleep(K_MSEC(10));
@@ -517,7 +556,8 @@ static void dump_frames_ble(void)
         }
     }
 
-    LOG_INF("Dump complete: %u frames, %u bytes.", frames_captured, total_bytes);
+    LOG_INF("Dump complete: %u frames, %u bytes (%u pixels/frame at stride %d).",
+            frames_captured, total_bytes, BLE_PIXELS_PER_FRAME, PIXEL_STRIDE);
 }
 
 /* ==========================================================================
@@ -581,7 +621,7 @@ BT_GATT_SERVICE_DEFINE(epc901_svc,
  * State machine:
  *   IDLE        → wait for capture_running or dump_requested
  *   CAPTURING   → capture frames to RAM as fast as possible
- *   DUMPING     → send all RAM frames over BLE
+ *   DUMPING     → send all RAM frames over BLE (subsampled)
  * ========================================================================== */
 void ble_burst_thread(void)
 {
@@ -637,10 +677,9 @@ void ble_burst_thread(void)
                 continue;
             }
 
-            /* Store frame as 8-bit in RAM */
+            /* Store full 1024-pixel frame as 8-bit in RAM */
             store_frame_8bit((const int16_t *)capture_buf, frames_captured);
-f           rames_captured++;
-
+            frames_captured++;
         }
 
         /* ---- DUMPING: send all frames over BLE ------------------------- */
@@ -716,7 +755,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
     capture_running = false;
     dump_requested  = false;
 
-    int err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad),
+    int err = bt_le_adv_start(BT_LE_ADV_CONN_ONE_TIME, ad, ARRAY_SIZE(ad),
                                sd, ARRAY_SIZE(sd));
     if (err) {
         LOG_ERR("Advertising restart failed (err %d)", err);
@@ -736,6 +775,8 @@ int main(void)
     LOG_INF("========================================");
     LOG_INF("  EPC901 BLE Transmitter — nRF54L15    ");
     LOG_INF("  RAM buffer: %u frames × %u bytes     ", MAX_FRAMES, BYTES_PER_FRAME);
+    LOG_INF("  Readout:    2 MHz READ → 512us/frame ");
+    LOG_INF("  BLE dump:   stride=%d → %d px/frame  ", PIXEL_STRIDE, BLE_PIXELS_PER_FRAME);
     LOG_INF("  Exposure:   %u µs                    ", EXPOSURE_US);
     LOG_INF("========================================");
 
@@ -751,7 +792,7 @@ int main(void)
         return -1;
     }
 
-    err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad),
+    err = bt_le_adv_start(BT_LE_ADV_CONN_ONE_TIME, ad, ARRAY_SIZE(ad),
                            sd, ARRAY_SIZE(sd));
     if (err) {
         LOG_ERR("Advertising start failed (err %d)", err);

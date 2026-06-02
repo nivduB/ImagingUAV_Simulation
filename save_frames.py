@@ -3,15 +3,20 @@ EPC901 Polar Frame Capture — RAM buffer mode.
 
 Flow:
   1. Press S → sends 0x01 to transmitter → starts capturing to RAM
-  2. Sensor captures 108 frames at ~6,500 fps (one full rotation at 60Hz)
+  2. Sensor captures 108 frames at 2Msps (512µs readout per frame)
   3. Press D → sends 0x02 to transmitter → dumps all frames over BLE
-  4. Python receives 108 × 1024 bytes, saves as .npy files
+  4. Python receives 108 × 342 bytes (every 3rd pixel, stride=3), saves as .npy
   5. Run plot_polar.py to reconstruct 360° image
+
+Note: All 1024 pixels are captured and stored on the nRF54L15 (EPC901 is a
+shift register — all pixels are always clocked out sequentially). The stride-3
+subsampling to 342 pixels/frame happens only during BLE transmission to reduce
+over-the-air transfer time.
 
 UART frame format from receiver:
   [0xAA] [0x55] [len_lo] [len_hi] [data...]
 
-Each frame = 1024 raw 8-bit bytes (no unpacking needed).
+Each frame = 342 raw 8-bit bytes (one BLE frame, stride-3 subsampled).
 
 Usage:
   python3 save_frames.py
@@ -31,7 +36,9 @@ import select
 PORT             = '/dev/tty.usbmodem0010507939193'
 BAUD             = 115200
 PIXELS_PER_FRAME = 1024
-BYTES_PER_FRAME  = 1024   # 8-bit pixels — 1 byte per pixel
+PIXEL_STRIDE     = 3
+BLE_PIXELS       = (PIXELS_PER_FRAME + PIXEL_STRIDE - 1) // PIXEL_STRIDE  # 342
+BYTES_PER_FRAME  = BLE_PIXELS   # 342 bytes received per frame (stride-3 subsampled)
 MAX_FRAMES       = 108
 OUTPUT_DIR       = 'frames'
 
@@ -67,7 +74,7 @@ def read_packet(ser: serial.Serial, timeout_s: float = 10.0) -> bytes | None:
 
 
 def collect_frame(ser: serial.Serial) -> np.ndarray | None:
-    """Collect packets until a full 1024-byte frame is assembled."""
+    """Collect packets until a full BYTES_PER_FRAME (342) byte frame is assembled."""
     frame_buffer = bytearray()
     while len(frame_buffer) < BYTES_PER_FRAME:
         packet = read_packet(ser)
@@ -76,7 +83,7 @@ def collect_frame(ser: serial.Serial) -> np.ndarray | None:
             return None
         frame_buffer.extend(packet)
 
-    # Raw 8-bit pixels — no unpacking needed
+    # Raw 8-bit pixels — 342 subsampled pixels per frame
     return np.frombuffer(bytes(frame_buffer[:BYTES_PER_FRAME]), dtype=np.uint8).copy()
 
 
@@ -84,14 +91,14 @@ def send_start(ser: serial.Serial):
     """Send 0x01 — start continuous capture to RAM."""
     ser.write(b'\x01')
     ser.flush()
-    print(">>> Sent START (0x01) — sensor capturing to RAM...")
+    print(">>> Sent START (0x01) — sensor capturing to RAM at 2Msps...")
 
 
 def send_stop(ser: serial.Serial):
-    """Send 0x02 — stop capture and dump all frames over BLE."""
+    """Send 0x02 — stop capture and dump all frames over BLE (stride-3)."""
     ser.write(b'\x02')
     ser.flush()
-    print(">>> Sent STOP (0x02) — waiting for BLE dump...")
+    print(f">>> Sent STOP (0x02) — waiting for BLE dump ({BLE_PIXELS} px/frame)...")
 
 
 def save_frame(pixels: np.ndarray, frame_num: int) -> str:
@@ -109,6 +116,9 @@ def main():
     parser = argparse.ArgumentParser(description='EPC901 polar frame capture')
     parser.add_argument('--port', type=str, default=PORT, help='Serial port')
     args = parser.parse_args()
+
+    print(f"Config: {BLE_PIXELS} pixels/frame (stride={PIXEL_STRIDE}, "
+          f"full={PIXELS_PER_FRAME}), {MAX_FRAMES} frames max")
 
     clear_frames_dir()
 
@@ -128,7 +138,6 @@ def main():
 
     try:
         while True:
-            # Check for keypress
             cmd = input("Command (S=start, D=dump): ").strip().upper()
 
             if cmd == 'S':
@@ -145,7 +154,8 @@ def main():
                 capturing = False
                 dumping   = True
 
-                print(f"Receiving up to {MAX_FRAMES} frames...")
+                print(f"Receiving up to {MAX_FRAMES} frames "
+                      f"({BYTES_PER_FRAME} bytes each)...")
                 start_time = time.time()
 
                 while frame_num < MAX_FRAMES:
