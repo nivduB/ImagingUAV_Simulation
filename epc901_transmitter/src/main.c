@@ -1,6 +1,6 @@
 /*
  * EPC901 BLE Transmitter — nRF54L15
- * nRF Connect SDK v3.1.1
+ * nRF Connect SDK v3.2.1
  *
  * Flow:
  *   CMD 0x01 → start continuous capture to RAM (no BLE during capture)
@@ -8,7 +8,7 @@
  *
  * Capture pipeline per frame:
  *   CLR_PIX → CLR_DATA → SHUTTER (26µs) → wait DATA_RDY →
- *   READ pulse (CDS) → 3 preload clocks → TIMER22 enable →
+ *   READ pulse (CDS) → 3 preload clocks → NRF_TIMER22 enable →
  *   GPIOTE hardware-toggles READ at 2MHz → SAADC samples VIDEO_P at 2Msps →
  *   EVT_DONE → store 1024 × 8-bit pixels in RAM frame buffer
  *
@@ -50,16 +50,14 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <hal/nrf_gpio.h>
 #include <nrfx_saadc.h>
+#include <hal/nrf_saadc.h>
 #include <nrfx_timer.h>
 #include <nrfx_gpiote.h>
 #include <helpers/nrfx_gppi.h>
-#if defined(DPPI_PRESENT)
-#include <nrfx_dppi.h>
-#else
-#include <nrfx_ppi.h>
-#endif
 
 LOG_MODULE_REGISTER(EPC901_TX, LOG_LEVEL_INF);
+
+#define EPC901_OK(err) (((err) == 0) || ((err) == NRFX_SUCCESS))
 
 /* ==========================================================================
  * UUIDs — must match receiver exactly
@@ -78,7 +76,7 @@ LOG_MODULE_REGISTER(EPC901_TX, LOG_LEVEL_INF);
 /* ==========================================================================
  * Pin definitions
  * ========================================================================== */
-#define NRF_SAADC_INPUT_AIN4   NRF_PIN_PORT_TO_PIN_NUMBER(11U, 1)  /* P1.11 — analog input for VIDEO_P (EPC901 pixel output) */
+#define VIDEO_P_ADC_INPUT ((nrfx_analog_input_t)4)  /* AIN4; P1.11 on nRF54L15 DK */
 
 #define PIN_DATA_RDY   NRF_GPIO_PIN_MAP(1, 10)  /* P1.10 — input:  EPC901 signals frame is ready to read out */
 #define PIN_READ       NRF_GPIO_PIN_MAP(1, 12)  /* P1.12 — output: GPIOTE hardware clock, pulses each pixel onto VIDEO_P */
@@ -95,7 +93,7 @@ LOG_MODULE_REGISTER(EPC901_TX, LOG_LEVEL_INF);
 #define MAX_FRAMES             108   /* one full rotation at 60Hz */
 #define BLE_PACKET_SIZE        244   /* MTU 247 − 3 bytes ATT overhead */
 #define PRELOAD_CLOCKS           3
-#define TIMER_INSTANCE_NUMBER   22
+#define TIMER_INSTANCE_NUMBER   NRF_TIMER22
 #define EXPOSURE_US             26   /* minimum EPC901 exposure time */
 
 /* Stride-based subsampling for BLE dump only.
@@ -114,28 +112,29 @@ LOG_MODULE_REGISTER(EPC901_TX, LOG_LEVEL_INF);
  * SAADC / Timer globals
  * ========================================================================== */
 static nrfx_saadc_channel_t   saadc_channel;
-static const nrfx_timer_t     timer_instance = NRFX_TIMER_INSTANCE(TIMER_INSTANCE_NUMBER);
+static nrfx_timer_t     timer_instance = NRFX_TIMER_INSTANCE(TIMER_INSTANCE_NUMBER);
 
 static int16_t  saadc_buf[2][PIXELS_PER_FRAME];
 static uint32_t saadc_current_buffer = 0;
 
 static volatile bool     capture_ready = false;
 static volatile int16_t *capture_buf   = NULL;
+static volatile bool     saadc_ready   = false;
 
-static uint8_t ppi_timer_to_saadc;
-static uint8_t ppi_saadc_end_to_start;
+static nrfx_gppi_handle_t ppi_timer_to_saadc;
+static nrfx_gppi_handle_t ppi_saadc_end_to_start;
 
 /* ==========================================================================
  * GPIOTE globals — hardware READ clock on P1.12
  * gpiote20 is the GPIOTE instance on the P1 power domain.
  * P2 pins do NOT support GPIOTE on nRF54L15 — only P1 pins do.
  * ========================================================================== */
-static nrfx_gpiote_t gpiote_inst_storage = NRFX_GPIOTE_INSTANCE(20);
+static nrfx_gpiote_t gpiote_inst_storage = NRFX_GPIOTE_INSTANCE(NRF_GPIOTE20);
 static nrfx_gpiote_t *gpiote_inst        = &gpiote_inst_storage;
 
 static uint8_t gpiote_read_channel;    /* GPIOTE output channel for READ */
-static uint8_t ppi_timer_to_read_set;  /* DPPI: CC[0] → READ high */
-static uint8_t ppi_timer_to_read_clr;  /* DPPI: CC[1] → READ low  */
+static nrfx_gppi_handle_t ppi_timer_to_read_set;  /* DPPI: CC[0] → READ high */
+static nrfx_gppi_handle_t ppi_timer_to_read_clr;  /* DPPI: CC[1] → READ low  */
 
 /* ==========================================================================
  * RAM frame buffer — 108 frames × 1024 bytes = 110,592 bytes
@@ -176,7 +175,7 @@ static void configure_digital_pins(void)
 
     /* PIN_READ (P1.12) intentionally omitted — configured by GPIOTE */
 
-    nrf_gpio_cfg_input(PIN_DATA_RDY, NRF_GPIO_PIN_PULLDOWN);
+    nrf_gpio_cfg_input(PIN_DATA_RDY, NRF_GPIO_PIN_PULLUP);
 
     LOG_INF("Digital pins configured (READ owned by GPIOTE).");
 }
@@ -197,12 +196,17 @@ static void configure_digital_pins(void)
  * ========================================================================== */
 static void configure_timer(void)
 {
+    LOG_INF("Initializing NRF_TIMER22...");
+
     nrfx_timer_config_t cfg = NRFX_TIMER_DEFAULT_CONFIG(16000000);
+    
     nrfx_err_t err = nrfx_timer_init(&timer_instance, &cfg, NULL);
-    if (err != NRFX_SUCCESS) {
+    if (!EPC901_OK(err)) {
         LOG_ERR("timer_init error: 0x%08x", err);
         return;
     }
+
+    LOG_INF("NRF_TIMER22 init OK");
 
     /* CC[0] = 8 ticks = 0.5µs — auto-clear → 2 MHz period */
     uint32_t ticks = nrfx_timer_us_to_ticks(&timer_instance, 1) / 2;
@@ -218,7 +222,7 @@ static void configure_timer(void)
                         ticks / 2,
                         false);
 
-    LOG_INF("TIMER22 configured: CC[0]=%u ticks (2MHz), CC[1]=%u ticks (0.25us)",
+    LOG_INF("NRF_TIMER22 configured: CC[0]=%u ticks (2MHz), CC[1]=%u ticks (0.25us)",
             ticks, ticks / 2);
 }
 
@@ -230,18 +234,22 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
     switch (p_event->type) {
 
     case NRFX_SAADC_EVT_READY:
-        LOG_DBG("SAADC READY");
+        LOG_INF("SAADC READY");
+        saadc_ready = true;
         break;
 
     case NRFX_SAADC_EVT_BUF_REQ:
+        LOG_INF("SAADC BUF_REQ");
         nrfx_saadc_buffer_set(
             saadc_buf[(saadc_current_buffer++) % 2],
             PIXELS_PER_FRAME);
         break;
 
     case NRFX_SAADC_EVT_DONE:
+        LOG_INF("SAADC DONE");
         nrfx_timer_disable(&timer_instance);
-        nrfx_gppi_channels_disable(BIT(ppi_saadc_end_to_start));
+        nrfx_timer_clear(&timer_instance);
+        nrfx_gppi_conn_disable(ppi_saadc_end_to_start);
 
         capture_buf   = p_event->data.done.p_buffer;
         capture_ready = true;
@@ -253,7 +261,7 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 }
 
 /* ==========================================================================
- * SAADC init — 2 Msps (driven by 2 MHz TIMER22 via DPPI)
+ * SAADC init — 2 Msps (driven by 2 MHz NRF_TIMER22 via DPPI)
  * ========================================================================== */
 static void configure_saadc(void)
 {
@@ -262,18 +270,17 @@ static void configure_saadc(void)
                 nrfx_isr, nrfx_saadc_irq_handler, 0);
 
     nrfx_err_t err = nrfx_saadc_init(DT_IRQ(DT_NODELABEL(adc), priority));
-    if (err != NRFX_SUCCESS) {
+    if (!EPC901_OK(err)) {
         LOG_ERR("saadc_init error: 0x%08x", err);
         return;
     }
 
-    saadc_channel = (nrfx_saadc_channel_t)NRFX_SAADC_DEFAULT_CHANNEL_SE(
-        NRF_SAADC_INPUT_AIN4, 0);
+    saadc_channel = (nrfx_saadc_channel_t)NRFX_SAADC_DEFAULT_CHANNEL_SE(VIDEO_P_ADC_INPUT, 0);
     saadc_channel.channel_config.gain     = NRF_SAADC_GAIN1_4;
     saadc_channel.channel_config.acq_time = 1;
 
     err = nrfx_saadc_channels_config(&saadc_channel, 1);
-    if (err != NRFX_SUCCESS) {
+    if (!EPC901_OK(err)) {
         LOG_ERR("saadc_channels_config error: 0x%08x", err);
         return;
     }
@@ -283,12 +290,12 @@ static void configure_saadc(void)
                                         NRF_SAADC_RESOLUTION_10BIT,
                                         &adv,
                                         saadc_event_handler);
-    if (err != NRFX_SUCCESS) {
+    if (!EPC901_OK(err)) {
         LOG_ERR("saadc_advanced_mode_set error: 0x%08x", err);
         return;
     }
 
-    LOG_INF("SAADC configured (AIN4, 10-bit, 2 Msps via 2MHz TIMER22).");
+    LOG_INF("SAADC configured (AIN4, 10-bit, 2 Msps via 2MHz NRF_TIMER22).");
 }
 
 /* ==========================================================================
@@ -296,34 +303,29 @@ static void configure_saadc(void)
  * ========================================================================== */
 static void configure_ppi(void)
 {
-    nrfx_err_t err;
+    int err;
 
-    err = nrfx_gppi_channel_alloc(&ppi_timer_to_saadc);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("gppi alloc (timer->saadc): 0x%08x", err);
+    err = nrfx_gppi_conn_alloc(
+        nrfx_timer_compare_event_address_get(&timer_instance, NRF_TIMER_CC_CHANNEL0),
+        nrf_saadc_task_address_get(NRF_SAADC, NRF_SAADC_TASK_SAMPLE),
+        &ppi_timer_to_saadc);
+    if (!EPC901_OK(err)) {
+        LOG_ERR("gppi conn alloc timer->saadc failed: %d", err);
         return;
     }
 
-    err = nrfx_gppi_channel_alloc(&ppi_saadc_end_to_start);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("gppi alloc (end->start): 0x%08x", err);
-        return;
-    }
-
-    nrfx_gppi_channel_endpoints_setup(
-        ppi_timer_to_saadc,
-        nrfx_timer_compare_event_address_get(&timer_instance,
-                                              NRF_TIMER_CC_CHANNEL0),
-        nrf_saadc_task_address_get(NRF_SAADC, NRF_SAADC_TASK_SAMPLE));
-
-    nrfx_gppi_channel_endpoints_setup(
-        ppi_saadc_end_to_start,
+    err = nrfx_gppi_conn_alloc(
         nrf_saadc_event_address_get(NRF_SAADC, NRF_SAADC_EVENT_END),
-        nrf_saadc_task_address_get(NRF_SAADC, NRF_SAADC_TASK_START));
+        nrf_saadc_task_address_get(NRF_SAADC, NRF_SAADC_TASK_START),
+        &ppi_saadc_end_to_start);
+    if (!EPC901_OK(err)) {
+        LOG_ERR("gppi conn alloc saadc end->start failed: %d", err);
+        return;
+    }
 
-    nrfx_gppi_channels_enable(BIT(ppi_timer_to_saadc));
+    nrfx_gppi_conn_enable(ppi_timer_to_saadc);
 
-    LOG_INF("DPPI configured.");
+    LOG_INF("GPPI configured.");
 }
 
 /* ==========================================================================
@@ -335,13 +337,13 @@ static void configure_gpiote_read(void)
 
     err = nrfx_gpiote_init(gpiote_inst,
                             DT_IRQ(DT_NODELABEL(gpiote20), priority));
-    if (err != NRFX_SUCCESS) {
+    if (!EPC901_OK(err)) {
         LOG_ERR("GPIOTE init failed: 0x%08x", err);
         return;
     }
 
     err = nrfx_gpiote_channel_alloc(gpiote_inst, &gpiote_read_channel);
-    if (err != NRFX_SUCCESS) {
+    if (!EPC901_OK(err)) {
         LOG_ERR("GPIOTE channel alloc failed: 0x%08x", err);
         return;
     }
@@ -358,35 +360,31 @@ static void configure_gpiote_read(void)
     };
     err = nrfx_gpiote_output_configure(gpiote_inst, PIN_READ,
                                         &out_cfg, &task_cfg);
-    if (err != NRFX_SUCCESS) {
+    if (!EPC901_OK(err)) {
         LOG_ERR("GPIOTE output configure failed: 0x%08x", err);
         return;
     }
     nrfx_gpiote_out_task_enable(gpiote_inst, PIN_READ);
 
-    err = nrfx_gppi_channel_alloc(&ppi_timer_to_read_set);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("gppi alloc (timer->read_set): 0x%08x", err);
+    err = nrfx_gppi_conn_alloc(
+    nrfx_timer_compare_event_address_get(&timer_instance, NRF_TIMER_CC_CHANNEL0),
+    nrfx_gpiote_set_task_address_get(gpiote_inst, PIN_READ),
+    &ppi_timer_to_read_set);
+    if (!EPC901_OK(err)) {
+        LOG_ERR("gppi conn alloc timer->read_set failed: %d", err);
         return;
     }
-    nrfx_gppi_channel_endpoints_setup(
-        ppi_timer_to_read_set,
-        nrfx_timer_compare_event_address_get(&timer_instance,
-                                              NRF_TIMER_CC_CHANNEL0),
-        nrfx_gpiote_set_task_address_get(gpiote_inst, PIN_READ));
-    nrfx_gppi_channels_enable(BIT(ppi_timer_to_read_set));
+    nrfx_gppi_conn_enable(ppi_timer_to_read_set);
 
-    err = nrfx_gppi_channel_alloc(&ppi_timer_to_read_clr);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("gppi alloc (timer->read_clr): 0x%08x", err);
+    err = nrfx_gppi_conn_alloc(
+        nrfx_timer_compare_event_address_get(&timer_instance, NRF_TIMER_CC_CHANNEL1),
+        nrfx_gpiote_clr_task_address_get(gpiote_inst, PIN_READ),
+        &ppi_timer_to_read_clr);
+    if (!EPC901_OK(err)) {
+        LOG_ERR("gppi conn alloc timer->read_clr failed: %d", err);
         return;
     }
-    nrfx_gppi_channel_endpoints_setup(
-        ppi_timer_to_read_clr,
-        nrfx_timer_compare_event_address_get(&timer_instance,
-                                              NRF_TIMER_CC_CHANNEL1),
-        nrfx_gpiote_clr_task_address_get(gpiote_inst, PIN_READ));
-    nrfx_gppi_channels_enable(BIT(ppi_timer_to_read_clr));
+    nrfx_gppi_conn_enable(ppi_timer_to_read_clr);
 
     LOG_INF("GPIOTE READ clock configured (hardware 2MHz toggle on P1.12).");
 }
@@ -399,27 +397,42 @@ static bool arm_saadc(void)
     nrfx_saadc_abort();
     k_usleep(10);
 
+    nrfx_timer_disable(&timer_instance);
+    nrfx_timer_clear(&timer_instance);
+
     capture_ready        = false;
     capture_buf          = NULL;
+    saadc_ready          = false;
     saadc_current_buffer = 0;
 
-    nrfx_gppi_channels_enable(BIT(ppi_saadc_end_to_start));
+    nrfx_gppi_conn_enable(ppi_saadc_end_to_start);
 
     nrfx_err_t err = nrfx_saadc_buffer_set(saadc_buf[0], PIXELS_PER_FRAME);
-    if (err != NRFX_SUCCESS) {
+    if (!EPC901_OK(err)) {
         LOG_ERR("buffer_set[0] error: 0x%08x", err);
         return false;
     }
 
     err = nrfx_saadc_buffer_set(saadc_buf[1], PIXELS_PER_FRAME);
-    if (err != NRFX_SUCCESS) {
+    if (!EPC901_OK(err)) {
         LOG_ERR("buffer_set[1] error: 0x%08x", err);
         return false;
     }
 
     err = nrfx_saadc_mode_trigger();
-    if (err != NRFX_SUCCESS) {
+    if (!EPC901_OK(err)) {
         LOG_ERR("mode_trigger error: 0x%08x", err);
+        return false;
+    }
+
+    uint32_t ready_timeout = 1000;
+    while (!saadc_ready && ready_timeout > 0) {
+        k_usleep(10);
+        ready_timeout--;
+    }
+
+    if (!saadc_ready) {
+        LOG_ERR("SAADC did not become READY after mode_trigger");
         return false;
     }
 
@@ -428,30 +441,54 @@ static bool arm_saadc(void)
 
 /* ==========================================================================
  * EPC901 capture sequence — one frame
- * Returns true when TIMER22 is running (hardware takes over).
+ * Returns true when NRF_TIMER22 is running (hardware takes over).
  * Caller must wait for capture_ready flag before reading capture_buf.
  * ========================================================================== */
 static bool epc901_capture(void)
 {
+    LOG_INF("Capture start: DATA_RDY=%d PWR_DOWN=%d CLR_PIX=%d CLR_DATA=%d SHUTTER=%d",
+            nrf_gpio_pin_read(PIN_DATA_RDY),
+            nrf_gpio_pin_read(PIN_PWR_DOWN),
+            nrf_gpio_pin_read(PIN_CLR_PIX),
+            nrf_gpio_pin_read(PIN_CLR_DATA),
+            nrf_gpio_pin_read(PIN_SHUTTER));
+
+    /* Full reset pulse: the documented EPC901 sequence includes CLR_PIX before CLR_DATA/SHUTTER. */
+    nrf_gpio_pin_set(PIN_CLR_PIX);
+    k_usleep(1);
+    nrf_gpio_pin_clear(PIN_CLR_PIX);
+    k_usleep(1);
+
     /* CLR_DATA and SHUTTER simultaneously — clears pixel field + frame
-     * store and starts exposure in one step. No separate CLR_PIX needed
-     * during continuous capture. 26µs >> 150ns CLR_DATA minimum. */
+     * store and starts exposure in one step. 26µs >> 150ns CLR_DATA minimum. */
     nrf_gpio_pin_set(PIN_CLR_DATA);
     nrf_gpio_pin_set(PIN_SHUTTER);
     k_usleep(EXPOSURE_US);          /* 26µs */
     nrf_gpio_pin_clear(PIN_SHUTTER);
     nrf_gpio_pin_clear(PIN_CLR_DATA);
 
-    /* Wait for DATA_RDY */
-    uint32_t timeout = 500;
-    while (nrf_gpio_pin_read(PIN_DATA_RDY) == 0 && timeout > 0) {
+    int data_rdy = nrf_gpio_pin_read(PIN_DATA_RDY);
+    LOG_INF("Before wait: DATA_RDY=%d", data_rdy);
+
+    /* Wait for DATA_RDY. Use the sampled value above so a short ready pulse is not missed
+     * between the debug log and the while-loop condition. */
+    uint32_t timeout = 10000;  /* 100 ms debug timeout: 10000 × 10 us */
+    while (data_rdy == 0 && timeout > 0) {
         k_usleep(10);
         timeout--;
+        data_rdy = nrf_gpio_pin_read(PIN_DATA_RDY);
     }
     if (timeout == 0) {
-        LOG_ERR("DATA_RDY timeout");
+        LOG_ERR("DATA_RDY timeout, final DATA_RDY=%d", data_rdy);
+        LOG_ERR("Pins: CLR_PIX=%d CLR_DATA=%d SHUTTER=%d PWR_DOWN=%d",
+                nrf_gpio_pin_read(PIN_CLR_PIX),
+                nrf_gpio_pin_read(PIN_CLR_DATA),
+                nrf_gpio_pin_read(PIN_SHUTTER),
+                nrf_gpio_pin_read(PIN_PWR_DOWN));
         return false;
     }
+
+    LOG_INF("DATA_RDY observed high; continuing readout.");
 
     /* CDS pulse */
     nrf_gpio_pin_set(PIN_READ);
@@ -468,7 +505,17 @@ static bool epc901_capture(void)
     }
 
     /* Hand off to hardware — 2MHz READ clock clocks out all 1024 pixels */
-    nrfx_timer_enable(&timer_instance);
+    LOG_INF("DEBUG: manually triggering %u SAADC samples.", PIXELS_PER_FRAME);
+
+    for (int i = 0; i < PIXELS_PER_FRAME; i++) {
+        nrf_saadc_task_trigger(NRF_SAADC, NRF_SAADC_TASK_SAMPLE);
+        for (int i = 0; i < PIXELS_PER_FRAME; i++) {
+            nrf_saadc_task_trigger(NRF_SAADC, NRF_SAADC_TASK_SAMPLE);
+            k_busy_wait(5);
+        }
+    }
+
+    LOG_INF("DEBUG: manual SAADC SAMPLE loop complete; waiting for SAADC DONE.");
     return true;
 }
 
@@ -671,9 +718,11 @@ void ble_burst_thread(void)
             }
 
             if (!capture_ready) {
-                LOG_ERR("SAADC timeout at frame %u.", frames_captured);
+                LOG_ERR("SAADC timeout at frame %u. capture_ready=%d capture_buf=%p",
+                        frames_captured, capture_ready, (void *)capture_buf);
                 nrfx_saadc_abort();
                 nrfx_timer_disable(&timer_instance);
+                nrfx_timer_clear(&timer_instance);
                 continue;
             }
 
@@ -755,7 +804,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
     capture_running = false;
     dump_requested  = false;
 
-    int err = bt_le_adv_start(BT_LE_ADV_CONN_ONE_TIME, ad, ARRAY_SIZE(ad),
+    int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
                                sd, ARRAY_SIZE(sd));
     if (err) {
         LOG_ERR("Advertising restart failed (err %d)", err);
@@ -792,7 +841,7 @@ int main(void)
         return -1;
     }
 
-    err = bt_le_adv_start(BT_LE_ADV_CONN_ONE_TIME, ad, ARRAY_SIZE(ad),
+    err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
                            sd, ARRAY_SIZE(sd));
     if (err) {
         LOG_ERR("Advertising start failed (err %d)", err);

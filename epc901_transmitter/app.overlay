@@ -1,0 +1,9 @@
+&timer22 {
+    status = "okay";
+};
+
+&gpiote20 {
+
+    status = "okay";
+
+};
