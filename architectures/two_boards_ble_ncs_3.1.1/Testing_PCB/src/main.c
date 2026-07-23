@@ -23,7 +23,7 @@
 #include <nrfx_timer.h>
 #include <helpers/nrfx_gppi.h>
 #if defined(DPPI_PRESENT)
-// #include <nrfx_dppi.h>
+#include <nrfx_dppi.h>
 #else
 #include <nrfx_ppi.h>
 #endif
@@ -58,7 +58,7 @@ LOG_MODULE_REGISTER(epc901_capture, LOG_LEVEL_INF);
 /* ------------------------------------------------------------------ */
 
 static nrfx_saadc_channel_t   channel;
-static nrfx_timer_t     timer_instance = NRFX_TIMER_INSTANCE(TIMER_INSTANCE_NUMBER);
+static const nrfx_timer_t     timer_instance = NRFX_TIMER_INSTANCE(TIMER_INSTANCE_NUMBER);
 
 static int16_t  saadc_buf[2][SAADC_BUFFER_SIZE];
 static uint32_t saadc_current_buffer = 0;
@@ -215,13 +215,13 @@ static void configure_ppi(void)
 {
     nrfx_err_t err;
 
-    err = nrfx_gppi_conn_alloc(&ppi_timer_to_saadc);
+    err = nrfx_gppi_channel_alloc(&ppi_timer_to_saadc);
     if (err != NRFX_SUCCESS) {
         LOG_ERR("gppi alloc (timer->saadc) error: 0x%08x", err);
         return;
     }
 
-    err = nrfx_gppi_conn_alloc(&ppi_saadc_end_to_start);
+    err = nrfx_gppi_channel_alloc(&ppi_saadc_end_to_start);
     if (err != NRFX_SUCCESS) {
         LOG_ERR("gppi alloc (saadc end->start) error: 0x%08x", err);
         return;
@@ -242,8 +242,8 @@ static void configure_ppi(void)
         nrf_saadc_task_address_get(NRF_SAADC, NRF_SAADC_TASK_START)
     );
 
-    nrfx_gppi_conn_enable(BIT(ppi_timer_to_saadc));
-    nrfx_gppi_conn_enable(BIT(ppi_saadc_end_to_start));
+    nrfx_gppi_channels_enable(BIT(ppi_timer_to_saadc));
+    nrfx_gppi_channels_enable(BIT(ppi_saadc_end_to_start));
 
     LOG_INF("DPPI configured");
 }
