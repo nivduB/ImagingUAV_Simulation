@@ -3,7 +3,5 @@
 };
 
 &gpiote20 {
-
     status = "okay";
-
 };

@@ -33,7 +33,7 @@ import sys
 import select
 
 # --- Config ---
-PORT             = '/dev/tty.usbmodem0010507939193'
+PORT             = '/dev/tty.usbmodem0010577240603'
 BAUD             = 115200
 PIXELS_PER_FRAME = 1024
 PIXEL_STRIDE     = 3

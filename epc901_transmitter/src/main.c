@@ -54,6 +54,7 @@
 #include <nrfx_timer.h>
 #include <nrfx_gpiote.h>
 #include <helpers/nrfx_gppi.h>
+#include <errno.h>
 
 LOG_MODULE_REGISTER(EPC901_TX, LOG_LEVEL_INF);
 
@@ -94,7 +95,7 @@ LOG_MODULE_REGISTER(EPC901_TX, LOG_LEVEL_INF);
 #define BLE_PACKET_SIZE        244   /* MTU 247 − 3 bytes ATT overhead */
 #define PRELOAD_CLOCKS           3
 #define TIMER_INSTANCE_NUMBER   NRF_TIMER22
-#define EXPOSURE_US             26   /* minimum EPC901 exposure time */
+#define EXPOSURE_US             26   /* minimum EPC901 exposure time */ /* Depending on the environment, exposure time might have to be adjusted */
 
 /* Stride-based subsampling for BLE dump only.
  * All 1024 pixels are always captured (EPC901 shift register requires all
@@ -167,6 +168,7 @@ static void configure_output(uint32_t pin)
 
 static void configure_digital_pins(void)
 {
+    LOG_INF("Configuring Digital Pins...");
     /* P2 pins — software GPIO only (P2 has no GPIOTE on nRF54L15) */
     configure_output(PIN_CLR_PIX);
     configure_output(PIN_SHUTTER);
@@ -177,7 +179,7 @@ static void configure_digital_pins(void)
 
     nrf_gpio_cfg_input(PIN_DATA_RDY, NRF_GPIO_PIN_PULLUP);
 
-    LOG_INF("Digital pins configured (READ owned by GPIOTE).");
+    LOG_INF("[V] Digital pins configured (READ owned by GPIOTE).");
 }
 
 /* ==========================================================================
@@ -222,7 +224,7 @@ static void configure_timer(void)
                         ticks / 2,
                         false);
 
-    LOG_INF("NRF_TIMER22 configured: CC[0]=%u ticks (2MHz), CC[1]=%u ticks (0.25us)",
+    LOG_INF("[V] NRF_TIMER22 configured: CC[0]=%u ticks (2MHz), CC[1]=%u ticks (0.25us)",
             ticks, ticks / 2);
 }
 
@@ -392,6 +394,36 @@ static void configure_gpiote_read(void)
 /* ==========================================================================
  * Arm SAADC for one frame capture
  * ========================================================================== */
+// Error Handling for SAADC
+ static const char *saadc_error_name(nrfx_err_t err)
+{
+    if ((int)err == -EALREADY) {
+        return "-EALREADY: buffer already supplied or operation already active";
+    }
+
+    if ((int)err == -EBUSY) {
+        return "-EBUSY: SAADC or buffer is busy";
+    }
+
+    if ((int)err == -EINVAL) {
+        return "-EINVAL: invalid argument or state";
+    }
+
+    if (err == NRFX_ERROR_ALREADY) {
+        return "NRFX_ERROR_ALREADY";
+    }
+
+    if (err == NRFX_ERROR_BUSY) {
+        return "NRFX_ERROR_BUSY";
+    }
+
+    if (err == NRFX_ERROR_INVALID_STATE) {
+        return "NRFX_ERROR_INVALID_STATE";
+    }
+
+    return "unknown error";
+}
+
 static bool arm_saadc(void)
 {
     nrfx_saadc_abort();
@@ -409,13 +441,21 @@ static bool arm_saadc(void)
 
     nrfx_err_t err = nrfx_saadc_buffer_set(saadc_buf[0], PIXELS_PER_FRAME);
     if (!EPC901_OK(err)) {
-        LOG_ERR("buffer_set[0] error: 0x%08x", err);
+        LOG_ERR(
+            "buffer_set[0] failed: %s; hex=0x%08x",
+            saadc_error_name(err),
+            (unsigned int)err
+        );
         return false;
     }
 
     err = nrfx_saadc_buffer_set(saadc_buf[1], PIXELS_PER_FRAME);
     if (!EPC901_OK(err)) {
-        LOG_ERR("buffer_set[1] error: 0x%08x", err);
+        LOG_ERR(
+            "buffer_set[1] failed: %s; hex=0x%08x",
+            saadc_error_name(err),
+            (unsigned int)err
+        );
         return false;
     }
 
@@ -466,6 +506,9 @@ static bool epc901_capture(void)
     k_usleep(EXPOSURE_US);          /* 26µs */
     nrf_gpio_pin_clear(PIN_SHUTTER);
     nrf_gpio_pin_clear(PIN_CLR_DATA);
+    k_usleep(1);
+
+    LOG_INF("Finished exposing SHUTTER: SHUTTER=%d", nrf_gpio_pin_read(PIN_SHUTTER));
 
     int data_rdy = nrf_gpio_pin_read(PIN_DATA_RDY);
     LOG_INF("Before wait: DATA_RDY=%d", data_rdy);
@@ -637,7 +680,7 @@ static ssize_t cmd_write(struct bt_conn *conn,
         frames_captured = 0;
         capture_running = true;
         dump_requested  = false;
-        LOG_INF("CMD 0x01 — starting capture (%u frames max).", MAX_FRAMES);
+        LOG_INF("CMD 0x01: starting capture (%u frames max).", MAX_FRAMES);
     } else if (cmd == 0x02) {
         /* Stop capture and dump all frames over BLE */
         capture_running = false;
@@ -822,10 +865,10 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 int main(void)
 {
     LOG_INF("========================================");
-    LOG_INF("  EPC901 BLE Transmitter — nRF54L15    ");
-    LOG_INF("  RAM buffer: %u frames × %u bytes     ", MAX_FRAMES, BYTES_PER_FRAME);
-    LOG_INF("  Readout:    2 MHz READ → 512us/frame ");
-    LOG_INF("  BLE dump:   stride=%d → %d px/frame  ", PIXEL_STRIDE, BLE_PIXELS_PER_FRAME);
+    LOG_INF("  EPC901 BLE Transmitter - nRF54L15    ");
+    LOG_INF("  RAM buffer: %u frames x %u bytes     ", MAX_FRAMES, BYTES_PER_FRAME);
+    LOG_INF("  Readout:    2 MHz READ -> 512us/frame ");
+    LOG_INF("  BLE dump:   stride=%d -> %d px/frame  ", PIXEL_STRIDE, BLE_PIXELS_PER_FRAME);
     LOG_INF("  Exposure:   %u µs                    ", EXPOSURE_US);
     LOG_INF("========================================");
 
@@ -852,7 +895,7 @@ int main(void)
 
     while (1) {
         k_sleep(K_SECONDS(10));
-        LOG_INF("Heartbeat — conn=%s ready=%s capturing=%s frames=%u",
+        LOG_INF("Heartbeat - conn=%s ready=%s capturing=%s frames=%u",
                 current_conn    ? "yes" : "no",
                 ble_ready       ? "yes" : "no",
                 capture_running ? "yes" : "no",
