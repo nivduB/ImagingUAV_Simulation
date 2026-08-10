@@ -49,6 +49,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <hal/nrf_gpio.h>
+#include <hal/nrf_saadc.h>
 #include <nrfx_saadc.h>
 #include <hal/nrf_saadc.h>
 #include <nrfx_timer.h>
@@ -177,9 +178,9 @@ static void configure_digital_pins(void)
 
     /* PIN_READ (P1.12) intentionally omitted — configured by GPIOTE */
 
-    nrf_gpio_cfg_input(PIN_DATA_RDY, NRF_GPIO_PIN_PULLUP);
+    nrf_gpio_cfg_input(PIN_DATA_RDY, NRF_GPIO_PIN_NOPULL);
 
-    LOG_INF("[V] Digital pins configured (READ owned by GPIOTE).");
+    LOG_INF("Digital pins configured (READ owned by GPIOTE).");
 }
 
 /* ==========================================================================
@@ -224,7 +225,7 @@ static void configure_timer(void)
                         ticks / 2,
                         false);
 
-    LOG_INF("[V] NRF_TIMER22 configured: CC[0]=%u ticks (2MHz), CC[1]=%u ticks (0.25us)",
+    LOG_INF("NRF_TIMER22 configured: CC[0]=%u ticks (2MHz), CC[1]=%u ticks (0.25us)",
             ticks, ticks / 2);
 }
 
@@ -486,7 +487,7 @@ static bool arm_saadc(void)
  * ========================================================================== */
 static bool epc901_capture(void)
 {
-    LOG_INF("Capture start: DATA_RDY=%d PWR_DOWN=%d CLR_PIX=%d CLR_DATA=%d SHUTTER=%d",
+    LOG_INF("=== epc901_capture start: DATA_RDY=%d, PWR_DOWN=%d, CLR_PIX=%d, CLR_DATA=%d, SHUTTER=%d ===",
             nrf_gpio_pin_read(PIN_DATA_RDY),
             nrf_gpio_pin_read(PIN_PWR_DOWN),
             nrf_gpio_pin_read(PIN_CLR_PIX),
@@ -494,27 +495,44 @@ static bool epc901_capture(void)
             nrf_gpio_pin_read(PIN_SHUTTER));
 
     /* Full reset pulse: the documented EPC901 sequence includes CLR_PIX before CLR_DATA/SHUTTER. */
+    LOG_INF("CLR_PIX: Resetting pixels and its controller.");
     nrf_gpio_pin_set(PIN_CLR_PIX);
-    k_usleep(1);
+    k_usleep(5);    /* T_PULSE_CLR_PIX = 5 clock cycles */
     nrf_gpio_pin_clear(PIN_CLR_PIX);
-    k_usleep(1);
+    k_usleep(33);   /* T_FLUSH = 32 clock cycles */
 
-    /* CLR_DATA and SHUTTER simultaneously — clears pixel field + frame
-     * store and starts exposure in one step. 26µs >> 150ns CLR_DATA minimum. */
+    LOG_INF("After CLR_PIX: DATA_RDY=%d", nrf_gpio_pin_read(PIN_DATA_RDY));
+
+    /* Clear internal data memory controller: CLR_DATA before SHUTTER */
+    LOG_INF("CLR_DATA: Clearing internal data memory controller");
     nrf_gpio_pin_set(PIN_CLR_DATA);
-    nrf_gpio_pin_set(PIN_SHUTTER);
-    k_usleep(EXPOSURE_US);          /* 26µs */
-    nrf_gpio_pin_clear(PIN_SHUTTER);
+    k_usleep(5);    /* T_PULSE_CLR_PIX = 5 clock cycles */
     nrf_gpio_pin_clear(PIN_CLR_DATA);
-    k_usleep(1);
+    k_usleep(33);   /* T_FLUSH = 32 clock cycles */
 
-    LOG_INF("Finished exposing SHUTTER: SHUTTER=%d", nrf_gpio_pin_read(PIN_SHUTTER));
+    LOG_INF("After CLR_DATA: DATA_RDY=%d", nrf_gpio_pin_read(PIN_DATA_RDY));
 
+    /* Checking if DATA_RDY = 0 after clearing data memory */
     int data_rdy = nrf_gpio_pin_read(PIN_DATA_RDY);
+    if (data_rdy != 0) {
+        LOG_ERR("CLR_DATA error: Failed clearing internal data memory controller, DATA_RDY=%d",
+                nrf_gpio_pin_read(PIN_DATA_RDY));
+        return false;
+    }
     LOG_INF("Before wait: DATA_RDY=%d", data_rdy);
 
+    /* Exposing light to be captured: SHUTTER */
+    LOG_INF("Start exposing SHUTTER");
+    nrf_gpio_pin_set(PIN_SHUTTER);
+    k_usleep(EXPOSURE_US);  /* 26µs */
+    LOG_INF("During SHUTTER: DATA_RDY=%d", nrf_gpio_pin_read(PIN_DATA_RDY));
+    nrf_gpio_pin_clear(PIN_SHUTTER);    
+    LOG_INF("Finished exposing SHUTTER");
+    LOG_INF("After finished exposing SHUTTER: DATA_RDY=%d", nrf_gpio_pin_read(PIN_DATA_RDY));
+    
     /* Wait for DATA_RDY. Use the sampled value above so a short ready pulse is not missed
      * between the debug log and the while-loop condition. */
+    data_rdy = nrf_gpio_pin_read(PIN_DATA_RDY);
     uint32_t timeout = 10000;  /* 100 ms debug timeout: 10000 × 10 us */
     while (data_rdy == 0 && timeout > 0) {
         k_usleep(10);
@@ -547,18 +565,11 @@ static bool epc901_capture(void)
         k_usleep(1);
     }
 
-    /* Hand off to hardware — 2MHz READ clock clocks out all 1024 pixels */
-    LOG_INF("DEBUG: manually triggering %u SAADC samples.", PIXELS_PER_FRAME);
-
-    for (int i = 0; i < PIXELS_PER_FRAME; i++) {
-        nrf_saadc_task_trigger(NRF_SAADC, NRF_SAADC_TASK_SAMPLE);
-        for (int i = 0; i < PIXELS_PER_FRAME; i++) {
-            nrf_saadc_task_trigger(NRF_SAADC, NRF_SAADC_TASK_SAMPLE);
-            k_busy_wait(5);
-        }
-    }
-
-    LOG_INF("DEBUG: manual SAADC SAMPLE loop complete; waiting for SAADC DONE.");
+    nrfx_timer_enable(&timer_instance);
+    LOG_INF("Timer started");
+    k_usleep(100);
+    uint32_t captured_count = nrfx_timer_capture(&timer_instance, NRF_TIMER_CC_CHANNEL2);
+    LOG_INF("COUNT=%u", captured_count);
     return true;
 }
 
@@ -750,7 +761,7 @@ void ble_burst_thread(void)
                 LOG_ERR("Capture sequence failed.");
                 nrfx_saadc_abort();
                 nrfx_timer_disable(&timer_instance);
-                continue;
+                break;
             }
 
             /* Wait for SAADC EVT_DONE */
@@ -761,12 +772,14 @@ void ble_burst_thread(void)
             }
 
             if (!capture_ready) {
+                LOG_INF("RESULT.MAXCNT = %u", NRF_SAADC->RESULT.MAXCNT);
+                LOG_INF("RESULT.AMOUNT = %u", NRF_SAADC->RESULT.AMOUNT);
                 LOG_ERR("SAADC timeout at frame %u. capture_ready=%d capture_buf=%p",
                         frames_captured, capture_ready, (void *)capture_buf);
                 nrfx_saadc_abort();
                 nrfx_timer_disable(&timer_instance);
                 nrfx_timer_clear(&timer_instance);
-                continue;
+                break;
             }
 
             /* Store full 1024-pixel frame as 8-bit in RAM */
